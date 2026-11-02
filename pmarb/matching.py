@@ -6,7 +6,9 @@ import unicodedata
 STOP = r"\b(fc|cf|afc|sc|ac|cd|ud|rcd|sd|club|de|the|calcio|ssc|as|1\.)\b"
 ALIASES = {"man united": "manchester united", "man city": "manchester city", "spurs": "tottenham",
            "nott m forest": "nottingham forest", "wolves": "wolverhampton", "ath madrid": "atletico madrid",
-           "ath bilbao": "athletic bilbao", "betis": "real betis", "sociedad": "real sociedad"}
+           "ath bilbao": "athletic bilbao", "betis": "real betis", "sociedad": "real sociedad",
+           "inter": "internazionale", "internazionale milano": "internazionale",
+           "wolverhampton wanderers": "wolverhampton"}
 
 
 def norm(name: str) -> str:
@@ -18,10 +20,21 @@ def norm(name: str) -> str:
 
 
 def sim(a: str, b: str) -> float:
+    """Similitud por PALABRAS completas ('milan' no casa con 'milano'), luego difflib."""
     a, b = norm(a), norm(b)
-    if a and b and (a in b or b in a):
+    wa, wb = set(a.split()), set(b.split())
+    if wa and wb and (wa <= wb or wb <= wa):
         return 0.95
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+WIN_RE = re.compile(r"^\s*will\s+(.+?)\s+win\b", re.I)
+
+
+def is_1x2(ev: dict) -> bool:
+    """Evento de resultado (local/empate/visitante), no hándicap ni más/menos goles."""
+    qs = [m.get("question", "") for m in ev.get("markets", [])]
+    return any(WIN_RE.search(q) for q in qs) and any(re.search(r"\bdraw\b", q, re.I) for q in qs)
 
 
 def split_title(title: str):
@@ -33,7 +46,13 @@ def outcome_of(question: str, home: str, away: str):
     """Mapea la pregunta binaria del mercado a H / D / A."""
     if re.search(r"\bdraw\b|empate", question, re.I):
         return "D"
-    sh, sa = sim_in(question, home), sim_in(question, away)
+    m = WIN_RE.search(question)
+    if m:
+        sh, sa = sim(m.group(1), home), sim(m.group(1), away)
+    else:
+        sh, sa = sim_in(question, home), sim_in(question, away)
+    if sh == sa:
+        return None                      # ambiguo: no se adivina
     return "H" if sh > sa else "A"
 
 
@@ -47,6 +66,8 @@ def match_event(home: str, away: str, candidates: list[dict], min_score=0.75):
     """candidates: eventos de Polymarket con 'title'. Devuelve el mejor o None."""
     best, best_s = None, 0.0
     for ev in candidates:
+        if ev.get("markets") and not is_1x2(ev):
+            continue
         sp = split_title(ev.get("title", ""))
         if not sp:
             continue

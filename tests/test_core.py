@@ -34,6 +34,11 @@ class Core(unittest.TestCase):
         self.assertIsNone(match_event("Leeds", "Burnley", evs))
         self.assertEqual(outcome_of("Will Chelsea FC win on 2025-03-16?", "Man United", "Chelsea"), "A")
         self.assertEqual(outcome_of("Will Man United vs. Chelsea end in a draw?", "Man United", "Chelsea"), "D")
+        self.assertEqual(outcome_of("Will Wolves win on 2025-09-20?", "Wolves", "Leeds"), "H")
+        self.assertEqual(outcome_of("Will FC Internazionale Milano win on 2025-11-23?", "Inter", "Milan"), "H")
+        self.assertEqual(outcome_of("Will AC Milan win on 2025-11-23?", "Inter", "Milan"), "A")
+        spread = {"title": "OGC Nice vs. Olympique Lyonnais", "markets": [{"question": "Spread: OGC Nice (-0.5)"}]}
+        self.assertIsNone(match_event("Nice", "Lyon", [spread]))
 
 
 class Costs(unittest.TestCase):
@@ -211,9 +216,12 @@ class BuildVolume(unittest.TestCase):
         from pmarb import dataset as ds
         ko = 1_760_000_000
         ev = {"title": "Arsenal FC vs. Chelsea FC", "eventDate": "2025-09-01",
-              "markets": [{"id": "1", "question": "Will Arsenal FC win on 2025-09-01?", "conditionId": "0xc",
-                           "outcomes": '["Yes","No"]', "clobTokenIds": '["t1","t2"]', "outcomePrices": '["0.5","0.5"]',
-                           "gameStartTime": pd.Timestamp(ko, unit="s", tz="UTC").isoformat()}]}
+              "markets": [{"id": str(i), "question": q, "conditionId": f"0xc{i}",
+                           "outcomes": '["Yes","No"]', "clobTokenIds": f'["t{i}","n{i}"]', "outcomePrices": '["0.5","0.5"]',
+                           "gameStartTime": pd.Timestamp(ko, unit="s", tz="UTC").isoformat()}
+                          for i, q in enumerate(["Will Arsenal FC win on 2025-09-01?",
+                                                 "Will Arsenal FC vs. Chelsea FC end in a draw?",
+                                                 "Will Chelsea FC win on 2025-09-01?"])]}
         # un trade cada hora durante 10 días; el volumen crece al acercarse el saque (100/h $)
         cache = {"trades": [{"t": ko - h * 3600, "usd": 100.0 / h} for h in range(1, 240)],
                  "oldest": ko - 239 * 3600, "exhausted": True, "capped": False}
@@ -227,7 +235,8 @@ class BuildVolume(unittest.TestCase):
         r = out.iloc[0]
         vols = [r.vol_24, r.vol_6, r.vol_close]
         self.assertEqual(len(set(vols)), 3)                          # tres ventanas distintas
-        self.assertEqual(tr.call_count, 1)                           # una sola consulta por mercado
+        self.assertEqual(tr.call_count, 3)                           # una consulta por mercado (3 mercados)
+        self.assertEqual(sorted(out.outcome), ["A", "D", "H"])
         exp = lambda lo_h, hi_h: sum(100.0 / h for h in range(1, 240) if lo_h < h <= hi_h)
         self.assertAlmostEqual(r.vol_close, exp(10 / 60, 10 / 60 + 168))   # [T-10min-7d, T-10min)
         self.assertAlmostEqual(r.vol_6, exp(6, 6 + 168))                   # [T-6h-7d, T-6h)

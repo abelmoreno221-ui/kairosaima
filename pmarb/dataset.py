@@ -77,7 +77,20 @@ def build(fd: pd.DataFrame, tag_slug="soccer", vol_window_h=168, kickoff_utc_hou
                 row[f"vol_{k_}"] = pm.volume_window(tc, t, W) if tc else None
             rows.append(row)
         log(f"[{k}] {r.HomeTeam}-{r.AwayTeam}: ok")
-    return pd.DataFrame(rows), matched.attrs["coverage"]
+    return validate(pd.DataFrame(rows), log), matched.attrs["coverage"]
+
+
+def validate(df: pd.DataFrame, log=print) -> pd.DataFrame:
+    """Quita partidos sin exactamente un mercado H, uno D y uno A (o con resultado != 1)."""
+    if df.empty:
+        return df
+    ok_set = df.groupby("match_id").outcome.apply(lambda x: sorted(map(str, x)) == ["A", "D", "H"])
+    ok_y = df.groupby("match_id").y.sum() == 1
+    good = ok_set & ok_y
+    bad = good[~good].index.tolist()
+    if bad:
+        log(f"VALIDACIÓN: {len(bad)} partidos excluidos por mapeo H/D/A inconsistente: {bad}")
+    return df[df.match_id.isin(good[good].index)].reset_index(drop=True)
 
 
 def _odds(p, margin):
