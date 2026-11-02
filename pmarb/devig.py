@@ -38,4 +38,5 @@ def shin(odds):
     return p / p.sum()
 
 
-METHODS = {"mult": multiplicative, "power": power, "shin": shin}
+# "log" = método logarítmico de Buchdahl (p_i = q_i^k), equivalente al power.
+METHODS = {"shin": shin, "prop": multiplicative, "log": power}

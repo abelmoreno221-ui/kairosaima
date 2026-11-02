@@ -8,11 +8,16 @@ from .http import get_json
 
 
 def load_football_data(path_or_url: str) -> pd.DataFrame:
+    """Devuelve cuotas de cierre (oH/oD/oA <- PSCH/PSCD/PSCA) y apertura (ooH/ooD/ooA <- PSH/PSD/PSA).
+    La apertura es el proxy de lo disponible a ~T-6h; el cierre no existe en el momento de decidir."""
     df = pd.read_csv(path_or_url, encoding="latin-1")
     df["date"] = pd.to_datetime(df["Date"], dayfirst=True).dt.date
-    cols = ("PSCH", "PSCD", "PSCA") if {"PSCH", "PSCD", "PSCA"} <= set(df) else ("PSH", "PSD", "PSA")
-    df = df.rename(columns=dict(zip(cols, ("oH", "oD", "oA"))))
-    return df[["date", "HomeTeam", "AwayTeam", "FTR", "oH", "oD", "oA"]].dropna()
+    ren = {"PSCH": "oH", "PSCD": "oD", "PSCA": "oA", "PSH": "ooH", "PSD": "ooD", "PSA": "ooA"}
+    df = df.rename(columns=ren)
+    for c in ren.values():
+        if c not in df:
+            df[c] = float("nan")
+    return df[["date", "HomeTeam", "AwayTeam", "FTR", *ren.values()]].dropna(subset=["FTR"])
 
 
 def odds_api_live(sport="soccer_epl", bookmaker="pinnacle", api_key=None):

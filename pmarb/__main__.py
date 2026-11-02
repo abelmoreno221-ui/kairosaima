@@ -1,7 +1,7 @@
 import argparse
 import json
 import pandas as pd
-from .backtest import Cfg, run
+from .backtest import Cfg, grid, table, with_book
 from .model import Blend
 
 
@@ -17,10 +17,11 @@ def main():
     s.add_argument("--out", default="dataset.csv")
     t = sp.add_parser("backtest")
     t.add_argument("data")
-    t.add_argument("--fee-rate", type=float, default=0.0)
-    t.add_argument("--min-edge", type=float, default=0.02)
+    t.add_argument("--fee-rate", type=float, default=0.05)
+    t.add_argument("--min-edge", type=float, default=0.04)
     t.add_argument("--half-spread", type=float, default=0.01)
-    t.add_argument("--trades-out", default="trades.csv")
+    t.add_argument("--min-liquidity", type=float, default=1000.0)
+    t.add_argument("--json-out", default="backtest.json")
     f = sp.add_parser("fit", help="ajusta pesos finales para el escáner")
     f.add_argument("data")
     f.add_argument("--out", default="weights.json")
@@ -38,11 +39,22 @@ def main():
         from .dataset import synthetic
         synthetic().to_csv(a.out, index=False)
     elif a.cmd == "backtest":
-        summ, tr = run(pd.read_csv(a.data), Cfg(fee_rate=a.fee_rate, min_edge=a.min_edge, half_spread=a.half_spread))
-        tr.to_csv(a.trades_out, index=False)
-        print(json.dumps(summ, indent=2))
+        cfg = Cfg(fee_rate=a.fee_rate, min_edge=a.min_edge, half_spread=a.half_spread,
+                  min_liquidity=a.min_liquidity)
+        res, verdict = grid(pd.read_csv(a.data), cfg)
+        import pandas as _pd
+        with _pd.option_context("display.width", 250, "display.max_columns", 30):
+            print(table(res).to_string(index=False))
+        print(json.dumps(verdict, indent=2, ensure_ascii=False))
+        seen = {}
+        for (l, m), s in res.items():
+            seen.setdefault(tuple(b["n_train"] for b in s["blocks"]), []).append(f"{l}/{m}")
+        for sizes, who in seen.items():
+            print(f"n_train por bloque ({', '.join(who)}):", " ".join(map(str, sizes)))
+        json.dump({f"{l}/{m}": s for (l, m), s in res.items()} | {"verdict": verdict},
+                  open(a.json_out, "w"), indent=2, default=str)
     elif a.cmd == "fit":
-        df = pd.read_csv(a.data)
+        df = with_book(pd.read_csv(a.data), "open", "shin")
         m = Blend().fit(df.p_pm.values, df.p_book.values, df.y.values)
         json.dump({"w": m.w.tolist(), "n": len(df)}, open(a.out, "w"))
         print("w =", m.w.round(3), "(intercepto, peso PM, peso casa)")

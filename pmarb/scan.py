@@ -12,7 +12,7 @@ from .model import Blend
 
 
 def scan(sport="soccer_epl", tag_slug="soccer", weights_path="weights.json", out="signals.csv",
-         cfg: Cfg = Cfg(), devig="shin"):
+         cfg: Cfg = Cfg(), devig="shin"  # señales en papel; sin órdenes):
     model = Blend()
     model.w = json.load(open(weights_path))["w"] if os.path.exists(weights_path) else [0.0, 0.0, 1.0]
     from .odds import odds_api_live
