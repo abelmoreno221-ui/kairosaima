@@ -26,3 +26,20 @@ def get_json(url: str, params: dict | None = None, retries: int = 3, timeout: in
             STATS["retries"] += 1
             print(f"HTTP-RETRY {i + 1}/{retries - 1} {url} -> {e!r}", file=sys.stderr)
             time.sleep(2 ** i)
+
+
+def get_bytes(url: str, retries: int = 3, timeout: int = 30) -> bytes:
+    """Descarga con el User-Agent del proyecto (algunos servidores bloquean el de Python por defecto)."""
+    STATS["calls"] += 1
+    for i in range(retries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            if i == retries - 1:
+                STATS["errors"] += 1
+                print(f"HTTP-ERROR {url} -> {e!r}", file=sys.stderr)
+                raise
+            STATS["retries"] += 1
+            print(f"HTTP-RETRY {i + 1}/{retries - 1} {url} -> {e!r}", file=sys.stderr)
+            time.sleep(2 ** i)

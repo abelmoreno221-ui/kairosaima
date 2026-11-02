@@ -16,6 +16,11 @@ ODDS = ["oH", "oD", "oA", "ooH", "ooD", "ooA"]
 POINTS = {"24": 24 * 3600, "6": 6 * 3600, "close": 10 * 60}  # segundos antes del saque
 
 
+def match_day(e: dict) -> str:
+    """Fecha del PARTIDO. Ojo: en Gamma 'startDate' es cuándo se creó el mercado (~2 semanas antes)."""
+    return (e.get("eventDate") or e.get("startTime") or e.get("endDate") or "")[:10]
+
+
 class LowCoverage(SystemExit):
     pass
 
@@ -23,7 +28,7 @@ class LowCoverage(SystemExit):
 def coverage(fd: pd.DataFrame, events: list, min_rate=0.30, min_matches=150, log=print):
     by_day = {}
     for e in events:
-        by_day.setdefault((e.get("startDate") or e.get("endDate") or "")[:10], []).append(e)
+        by_day.setdefault(match_day(e), []).append(e)
     pairs = []
     for _, r in fd.iterrows():
         cands = sum((by_day.get(str(pd.Timestamp(r.date) + pd.Timedelta(days=o))[:10], []) for o in (-1, 0, 1)), [])

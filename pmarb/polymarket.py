@@ -16,9 +16,10 @@ def events(tag_slug="soccer", closed=False, limit=100, offset=0, **extra):
 
 
 def iter_events(tag_slug="soccer", closed=False, max_pages=500, page=100, start=None, end=None):
-    """Pagina hasta agotar. start/end (YYYY-MM-DD) acotan por fecha de inicio del evento
-    (start_date_min/max en Gamma) para no depender de un tope de páginas."""
-    extra = {"start_date_min": start, "start_date_max": end} if start or end else {}
+    """Pagina hasta agotar. start/end (YYYY-MM-DD) acotan por fecha del partido (end_date_min/max
+    en Gamma) para no depender de un tope de páginas."""
+    # endDate = hora del saque en los partidos; startDate es la creación del mercado.
+    extra = {"end_date_min": start, "end_date_max": end} if start or end else {}
     for i in range(max_pages):
         batch = events(tag_slug, closed, page, i * page, **extra)
         if not batch:

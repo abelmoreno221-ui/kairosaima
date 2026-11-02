@@ -97,7 +97,12 @@ def load_football_data(srcs, book="PS", until=None, log=print) -> pd.DataFrame:
     need = list(_cols(book))
     out, drops, absent = [], [], []
     for src in ([srcs] if isinstance(srcs, str) else srcs):
-        df = pd.read_csv(src, encoding="latin-1")
+        if str(src).startswith("http"):
+            import io
+            from .http import get_bytes
+            df = pd.read_csv(io.BytesIO(get_bytes(src)), encoding="latin-1")
+        else:
+            df = pd.read_csv(src, encoding="latin-1")
         miss = [c for c in (*BASE_COLS, *need) if c not in df.columns]
         if miss:
             absent.append((src, miss))

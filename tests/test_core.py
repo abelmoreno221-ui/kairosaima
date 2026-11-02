@@ -210,7 +210,7 @@ class BuildVolume(unittest.TestCase):
     def test_volume_per_horizon_differs(self):
         from pmarb import dataset as ds
         ko = 1_760_000_000
-        ev = {"title": "Arsenal FC vs. Chelsea FC", "startDate": "2025-09-01",
+        ev = {"title": "Arsenal FC vs. Chelsea FC", "eventDate": "2025-09-01",
               "markets": [{"id": "1", "question": "Will Arsenal FC win on 2025-09-01?", "conditionId": "0xc",
                            "outcomes": '["Yes","No"]', "clobTokenIds": '["t1","t2"]', "outcomePrices": '["0.5","0.5"]',
                            "gameStartTime": pd.Timestamp(ko, unit="s", tz="UTC").isoformat()}]}
@@ -248,7 +248,7 @@ class Coverage(unittest.TestCase):
     def test_aborts_on_low_overlap(self):
         fd = pd.DataFrame({"date": pd.to_datetime(["2025-09-01"] * 3).date, "league": "E0",
                            "HomeTeam": ["Arsenal", "Leeds", "Wolves"], "AwayTeam": ["Chelsea", "Burnley", "Fulham"]})
-        evs = [{"title": "Arsenal FC vs. Chelsea FC", "startDate": "2025-09-01"}]
+        evs = [{"title": "Arsenal FC vs. Chelsea FC", "eventDate": "2025-09-01"}]
         with self.assertRaises(LowCoverage):
             coverage(fd, evs, min_rate=0.5, min_matches=1, log=lambda *_: None)
         self.assertEqual(len(coverage(fd, evs, min_rate=0.3, min_matches=1, log=lambda *_: None)), 1)
