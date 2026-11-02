@@ -46,6 +46,13 @@ Busca partidos de fútbol en los que el precio de Polymarket no coincide con la 
 | 6 | `backtest.py` | Walk-forward sobre la rejilla {cierre, apertura} × {shin, prop, log} × medio spread {0,01, 0,02, 0,03, 0,05 [, calibrado]}. La comisión de taker (`shares·0,05·p·(1−p)`) se cobra al entrar, gane o pierda. El EV se calcula sobre el ask. La liquidez es el volumen negociado en los 7 días previos a cada punto de decisión, sacado de data-api `/trades`. Ese endpoint devuelve lo más reciente primero, así que se pagina con `offset` hasta pasar el inicio de la ventana; cada mercado se consulta una vez y se guarda en caché. Si se agota el offset antes, el volumen queda como **desconocido** y esos mercados se reportan en una línea aparte, sin descartarlos. Reporta señales por semana, nivel de spread al que muere el edge, grupos de señales y guardarraíl de Brier |
 | 7 | `scan.py` | Escáner en vivo: compara Pinnacle con el order book real y escribe las señales en `signals.csv` |
 
+## Instalación en Windows (un comando)
+Descarga `scripts/setup_windows.ps1` y ejecútalo desde PowerShell. Crea `%USERPROFILE%\pmarb`, clona esta rama, instala y lanza el paso 1:
+```
+powershell -ExecutionPolicy Bypass -File setup_windows.ps1
+powershell -ExecutionPolicy Bypass -File setup_windows.ps1 C:\ruta\csv_2526   # si football-data da 403
+```
+
 ## Uso
 ```bash
 pip install -r requirements.txt
