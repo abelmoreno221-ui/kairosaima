@@ -30,7 +30,19 @@ OPEN_HORIZON_H = (24, 72)
 DECISION_H = 24  # punto de decisión con la línea de apertura (backtest y escáner)
 
 
-def fd_urls(seasons=("2526",), leagues=("E0", "SP1", "I1", "D1", "F1")):
+LEAGUES = ("E0", "SP1", "D1", "I1", "F1")  # solo primeras divisiones: en segundas la cobertura de PM es marginal
+
+
+def check_scope(track: str, seasons, leagues):
+    """Pista A solo 25/26 (26/27 no tiene PSH). Ligas solo de LEAGUES."""
+    bad = [l for l in leagues if l not in LEAGUES]
+    if bad:
+        raise SystemExit(f"Ligas no permitidas {bad}: solo {list(LEAGUES)} (sin segundas divisiones).")
+    if track == "A" and tuple(seasons) != ("2526",):
+        raise SystemExit("La pista A es solo --seasons 2526: 26/27 no tiene PSH y no aporta filas.")
+
+
+def fd_urls(seasons=("2526",), leagues=LEAGUES):
     return [FD_URL.format(season=s, league=l) for s in seasons for l in leagues]
 
 

@@ -16,7 +16,7 @@ def main():
     b.add_argument("--book", choices=["Avg", "Max"], help="solo pista C (por defecto Avg)")
     b.add_argument("--seasons", nargs="+", help="sobrescribe las temporadas de la pista (p. ej. 2526 2627)")
     b.add_argument("--fd", nargs="*", help="CSV locales de la temporada de la pista; si no, se descargan")
-    b.add_argument("--leagues", nargs="+", default=["E0", "SP1", "I1", "D1", "F1"])
+    b.add_argument("--leagues", nargs="+", default=["E0", "SP1", "D1", "I1", "F1"])
     b.add_argument("--tag", default="soccer")
     b.add_argument("--vol-window-h", type=int, default=168, help="ventana de volumen previo a cada decisión")
     b.add_argument("--min-coverage", type=float, default=0.30)
@@ -51,13 +51,15 @@ def main():
 
     if a.cmd == "build":
         from .dataset import build
-        from .odds import load_football_data, fd_urls, TRACKS
+        from .odds import load_football_data, fd_urls, TRACKS, check_scope
         tr = TRACKS[a.track]
         print(f"Pista {a.track}: {tr['note']}")
         if a.book and a.track != "C":
             raise SystemExit("--book solo vale para la pista C: las pistas A y B no cambian de casa.")
         book = a.book or tr["book"]
-        fd = load_football_data(a.fd or fd_urls(a.seasons or tr["seasons"], a.leagues), book, tr["until"])
+        seasons = a.seasons or tr["seasons"]
+        check_scope(a.track, seasons, a.leagues)
+        fd = load_football_data(a.fd or fd_urls(seasons, a.leagues), book, tr["until"])
         out = a.out if a.out != "dataset.csv" else f"dataset_{a.track}.csv"
         drops = fd.attrs["drops"]
         if fd.attrs["absent"]:
@@ -66,6 +68,15 @@ def main():
         ds, cov = build(fd, a.tag, vol_window_h=a.vol_window_h, min_rate=a.min_coverage, min_matches=a.min_matches)
         ds.to_csv(out, index=False)
         cov.to_csv(out.replace(".csv", ".coverage.csv"), index=False)
+        print("\n=== PASO 1: leer solo esto ===")
+        print(cov.to_string(index=False))
+        print(f"TOTAL emparejados: {int(cov.matched.sum())} (mínimo 150 para seguir al backtest)")
+        for _, r in drops.fillna("").iterrows():
+            if r.pattern == "columna ausente":
+                print(f"  {r.file}: COLUMNA AUSENTE {r.missing}")
+            else:
+                print(f"  {r.file}: {int(r.dropped_no_open)} sin apertura, {int(r.dropped_no_close)} sin cierre, "
+                      f"{int(r.cut_by_date)} fuera por corte de fecha -> {r.pattern}")
         print(f"-> {out}")
     elif a.cmd == "synthetic":
         from .dataset import synthetic

@@ -21,6 +21,8 @@ Busca partidos de fútbol en los que el precio de Polymarket no coincide con la 
 - **Valor vacío:** se descarta la fila y se cuenta. El informe muestra por fichero las fechas descartadas y si forman un **bloque** (corte de la fuente, p. ej. "bloque final desde 2026-01-08") o un **goteo** (huecos sueltos).
 - **Columna ausente en un fichero** (p. ej. `PSH` en 26/27): aviso con el nombre del fichero, ese fichero se omite, la temporada se trunca en el último partido con datos y se continúa. Solo se aborta si la columna falta en todos los ficheros, con el mensaje "columna ausente".
 - El backtest se aborta si un dataset mezcla casas.
+- **Alcance:** la pista A es solo `--seasons 2526`, porque 26/27 no tiene `PSH`. Ligas: solo E0, SP1, D1, I1 y F1. Las segundas divisiones se rechazan, porque la cobertura de Polymarket ahí es marginal y gastarían llamadas antes de caer en el chequeo de cobertura.
+- **Volumen por horizonte:** ventana de 7 días que termina en cada punto de decisión (T-24h, T-6h y T-10min). Son tres valores por mercado calculados con una sola consulta a `/trades`.
 - **Betfair Exchange:** es un exchange, no una casa. No tiene margen en la cuota; cobra una comisión del 5 % sobre la ganancia neta, rebajable al 2 %. En 25/26 hay 22 partidos sin cierre de BFE, que se descartan.
 
 ### Horizontes (`backtest --decision-h`)

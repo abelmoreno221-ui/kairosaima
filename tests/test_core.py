@@ -206,6 +206,44 @@ class Spreads(unittest.TestCase):
         self.assertLessEqual(max(x[4] for x in table), 0.03)
 
 
+class BuildVolume(unittest.TestCase):
+    def test_volume_per_horizon_differs(self):
+        from pmarb import dataset as ds
+        ko = 1_760_000_000
+        ev = {"title": "Arsenal FC vs. Chelsea FC", "startDate": "2025-09-01",
+              "markets": [{"id": "1", "question": "Will Arsenal FC win on 2025-09-01?", "conditionId": "0xc",
+                           "outcomes": '["Yes","No"]', "clobTokenIds": '["t1","t2"]', "outcomePrices": '["0.5","0.5"]',
+                           "gameStartTime": pd.Timestamp(ko, unit="s", tz="UTC").isoformat()}]}
+        # un trade cada hora durante 10 días; el volumen crece al acercarse el saque (100/h $)
+        cache = {"trades": [{"t": ko - h * 3600, "usd": 100.0 / h} for h in range(1, 240)],
+                 "oldest": ko - 239 * 3600, "exhausted": True, "capped": False}
+        fd = pd.DataFrame({"date": [pd.Timestamp("2025-09-01").date()], "league": ["E0"], "HomeTeam": ["Arsenal"],
+                           "AwayTeam": ["Chelsea"], "FTR": ["H"], "source": ["PS"],
+                           **{c: [2.0] for c in ["oH", "oD", "oA", "ooH", "ooD", "ooA"]}})
+        with mock.patch.object(pm, "iter_events", return_value=[ev]), \
+             mock.patch.object(pm, "prices_at", return_value=[0.5, 0.5, 0.5]), \
+             mock.patch.object(pm, "trades", return_value=cache) as tr:
+            out, _ = ds.build(fd, min_rate=0, min_matches=1, log=lambda *_: None)
+        r = out.iloc[0]
+        vols = [r.vol_24, r.vol_6, r.vol_close]
+        self.assertEqual(len(set(vols)), 3)                          # tres ventanas distintas
+        self.assertEqual(tr.call_count, 1)                           # una sola consulta por mercado
+        exp = lambda lo_h, hi_h: sum(100.0 / h for h in range(1, 240) if lo_h < h <= hi_h)
+        self.assertAlmostEqual(r.vol_close, exp(10 / 60, 10 / 60 + 168))   # [T-10min-7d, T-10min)
+        self.assertAlmostEqual(r.vol_6, exp(6, 6 + 168))                   # [T-6h-7d, T-6h)
+        self.assertAlmostEqual(r.vol_24, exp(24, 24 + 168))                # [T-24h-7d, T-24h)
+
+
+class Scope(unittest.TestCase):
+    def test_track_A_only_2526_and_top_leagues(self):
+        from pmarb.odds import check_scope
+        check_scope("A", ["2526"], ["E0", "SP1", "D1", "I1", "F1"])
+        with self.assertRaises(SystemExit):
+            check_scope("A", ["2526", "2627"], ["E0"])
+        with self.assertRaises(SystemExit):
+            check_scope("A", ["2526"], ["E1"])
+
+
 class Coverage(unittest.TestCase):
     def test_aborts_on_low_overlap(self):
         fd = pd.DataFrame({"date": pd.to_datetime(["2025-09-01"] * 3).date, "league": "E0",
