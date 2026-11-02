@@ -35,11 +35,14 @@ def coverage(fd: pd.DataFrame, events: list, min_rate=0.30, min_matches=150, log
     if n < min_matches or rate < min_rate:
         raise LowCoverage(f"ABORTADO: solo {n} partidos emparejados ({rate:.1%}) "
                           f"< mínimo {min_matches} partidos / {min_rate:.0%}. No se calculan cifras.")
-    return fd[fd._ev.notna()]
+    out = fd[fd._ev.notna()]
+    out.attrs["coverage"] = rep.reset_index()
+    return out
 
 
 def build(fd: pd.DataFrame, tag_slug="soccer", close_lead_min=10, decision_h=DECISION_H,
           vol_window_h=168, kickoff_utc_hour=12, min_rate=0.30, min_matches=150, log=print):
+    """Devuelve (dataset, cobertura_por_liga). decision_h: punto de decisión con la apertura (24 o 6)."""
     matched = coverage(fd, list(pm.iter_events(tag_slug, closed=True)), min_rate, min_matches, log)
     W = vol_window_h * 3600
     rows = []
@@ -61,9 +64,9 @@ def build(fd: pd.DataFrame, tag_slug="soccer", close_lead_min=10, decision_h=DEC
                          "match_id": f"{r.league}_{r.date}_{r.HomeTeam}_{r.AwayTeam}", "league": r.league,
                          "source": r.source, "outcome": o, "question": mk["question"], "y": int(r.FTR == o),
                          "p_pm_open": p_open, "p_pm_close": p_close, "vol_open": vol(t_open),
-                         "vol_close": vol(t_close), **{c: r[c] for c in ODDS}})
+                         "vol_close": vol(t_close), "decision_h": decision_h, **{c: r[c] for c in ODDS}})
         log(f"[{k}] {r.HomeTeam}-{r.AwayTeam}: ok")
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), matched.attrs["coverage"]
 
 
 def _odds(p, margin):
@@ -88,6 +91,7 @@ def synthetic(n_matches=1500, pm_noise=0.35, open_noise=0.20, close_noise=0.10, 
             ts = int(i * 86400 / per_day)
             p_close = float(sg(lg(true[j]) + rng.normal(0, pm_noise)))
             rows.append({"ts_open": ts - 86400, "ts_close": ts, "match_id": i, "source": "SIM", "outcome": o,
+                         "league": ("E0", "SP1", "I1", "D1", "F1")[i % 5], "decision_h": 24,
                          "p_pm_open": float(sg(lg(p_close) + rng.normal(0, 0.1))), "p_pm_close": p_close,
                          "y": int(res == j), "vol_open": vol * 0.6, "vol_close": vol,
                          "oH": oc[0], "oD": oc[1], "oA": oc[2], "ooH": oo[0], "ooD": oo[1], "ooA": oo[2]})

@@ -9,7 +9,7 @@ from pmarb.model import Blend
 from pmarb.matching import match_event, outcome_of
 from pmarb.backtest import (Cfg, decide, run, with_book, grid, fee_per_share, settle, half_spread_at,
                             check_single_source, _solo_fails)
-from pmarb.odds import choose_book, load_football_data, TRACKS
+from pmarb.odds import load_football_data, TRACKS
 from pmarb import spreads as spr
 from pmarb.dataset import synthetic, coverage, LowCoverage
 from pmarb import polymarket as pm
@@ -130,16 +130,24 @@ class Sources(unittest.TestCase):
         pd.DataFrame(cols).to_csv(path, index=False)
         return path
 
-    def test_fallback_avg_before_max(self):
-        raws = [pd.DataFrame({"AvgH": [2.0], "MaxH": [2.2]})]
-        self.assertEqual(choose_book(raws, "PS", log=lambda *_: None), "Avg")
-        self.assertEqual(choose_book([pd.DataFrame({"MaxH": [2.2]})], "PS", log=lambda *_: None), "Max")
-
-    def test_one_source_for_all_files(self):
+    def test_drops_rows_never_switches_book(self):
         with tempfile.TemporaryDirectory() as d:
             f1, f2 = self._csv(d, "a.csv", ["PS", "Avg"]), self._csv(d, "b.csv", ["Avg"])
             df = load_football_data([f1, f2], "PS", log=lambda *_: None)
-            self.assertEqual(set(df.source), {"Avg"})        # no PS en un fichero y Avg en otro
+            self.assertEqual(set(df.source), {"PS"})
+            self.assertEqual(len(df), 2)                     # b.csv sin PS: sus filas se descartan
+            with self.assertRaises(SystemExit):
+                load_football_data([f2], "PS", log=lambda *_: None)
+
+    def test_drops_rows_without_close(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = self._csv(d, "a.csv", ["BFE"])
+            x = pd.read_csv(f); x.loc[0, "BFECH"] = None; x.to_csv(f, index=False)
+            self.assertEqual(len(load_football_data(f, "BFE", log=lambda *_: None)), 1)
+
+    def test_track_C_invalid(self):
+        self.assertFalse(TRACKS["C"]["valid"])
+        self.assertTrue(TRACKS["A"]["valid"])
 
     def test_track_A_cutoff(self):
         with tempfile.TemporaryDirectory() as d:
@@ -195,6 +203,13 @@ class Grid(unittest.TestCase):
         for k in ("edge_dies_at_half_spread", "guardrail", "guardrail_warning", "verdict", "horizons"):
             self.assertIn(k, self.v)
         self.assertIn("referencia", self.v["verdict"])      # fuente SIM != Pinnacle -> no es veredicto
+        fn = pd.DataFrame(self.v["funnel"])
+        self.assertEqual(list(fn.columns[1:6]), ["emparejados", "vivo_T-24h", "supera_volumen",
+                                                  "vol_desconocido", "con_señal_neta"])
+        self.assertTrue((fn.emparejados >= fn["vivo_T-24h"]).all())
+        self.assertTrue((fn["vivo_T-24h"] >= fn.supera_volumen).all())
+        self.assertTrue((fn.supera_volumen >= fn.con_señal_neta).all())
+        self.assertIn("regla_pin", self.res[("open", "shin", "0.01")])
 
     def test_solo_modelo_losing_downgrades(self):
         s = {"groups": {"solo_modelo": {"n": 40, "roi": -0.05}}}
@@ -202,15 +217,35 @@ class Grid(unittest.TestCase):
         s["groups"]["solo_modelo"]["n"] = 10
         self.assertFalse(_solo_fails(s))
 
-    def test_verdict_no_candidata(self):
+    def _verdict(self, alive=True, solo_fails=False, solo_n=40, n=400, src="PS"):
         import pmarb.backtest as bt
-        with mock.patch.object(bt, "_solo_fails", return_value=True), mock.patch.object(bt, "_alive", return_value=True):
-            _, v = grid(synthetic(400).assign(source="PS"), Cfg(min_train=200), methods=("shin",), spreads=(0.01,))
-        self.assertTrue(v["verdict"].startswith("no candidata"))
+        df = synthetic(400).assign(source=src)
+        orig = bt.summarize
+        def fake(*a, **k):
+            r = orig(*a, **k)
+            r["signals"] = n
+            r["groups"]["solo_modelo"]["n"] = solo_n
+            r["groups"]["con_pinnacle"]["roi_ci95"] = [0.01, 0.05]
+            return r
+        with mock.patch.object(bt, "_solo_fails", return_value=solo_fails), \
+             mock.patch.object(bt, "_alive", return_value=alive), mock.patch.object(bt, "summarize", fake):
+            return grid(df, Cfg(min_train=200), methods=("shin",), spreads=(0.01,))[1]
 
-    def test_wider_spread_fewer_signals(self):
-        self.assertGreaterEqual(self.res[("open", "shin", "0.01")]["signals"],
-                                self.res[("open", "shin", "0.05")]["signals"])
+    def test_verdict_no_candidata(self):
+        self.assertTrue(self._verdict(solo_fails=True)["verdict"].startswith("no candidata"))
+
+    def test_verdict_floor_150_bets(self):
+        self.assertTrue(self._verdict(n=149)["verdict"].startswith("no evaluable"))
+        self.assertTrue(self._verdict(n=150)["verdict"].startswith("candidata"))
+
+    def test_small_solo_recommends_pinnacle_rule(self):
+        v = self._verdict(solo_n=5)
+        self.assertTrue(v["verdict"].startswith("no evaluable"))
+        self.assertTrue(any("quitar la regresión" in r for r in v["recommendation"]))
+        self.assertTrue(any("NO es el ROI de la regla" in r for r in v["recommendation"]))
+
+    def test_track_C_marked_invalid(self):
+        self.assertIn("NO VÁLIDO", self._verdict(src="Max")["verdict"])
 
     def test_no_edge_when_sources_equal(self):
         df = with_book(synthetic(800, pm_noise=0.0, close_noise=0.0, margin=0.0), "close", "prop")

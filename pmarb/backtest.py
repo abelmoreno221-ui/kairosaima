@@ -26,6 +26,9 @@ LINES = {"close": ("oH", "oD", "oA"), "open": ("ooH", "ooD", "ooA")}
 HOURS = {"open": 24.0, "close": 10 / 60}
 HORIZON = {"open": "apertura T-24h..T-72h, decisión PM a T-24h", "close": "cierre al saque, decisión a T-10min"}
 VALID_BOOK = "PS"
+INVALID_BOOKS = ("Avg", "Max")
+MIN_BETS = 150          # suelo de muestra: por debajo, ningún veredicto pasa de "no evaluable"
+FUNNEL_MIN = 20         # partidos por liga que superan el volumen a T-24h; por debajo -> mover a T-6h
 SPREADS = (0.01, 0.02, 0.03, 0.05)
 
 
@@ -90,7 +93,7 @@ def with_book(df: pd.DataFrame, line="close", method="shin") -> pd.DataFrame:
     df = df.copy()
     if f"p_pm_{line}" in df:
         df["ts"], df["p_pm"], df["vol_before"] = df[f"ts_{line}"], df[f"p_pm_{line}"], df[f"vol_{line}"]
-    df["hours"] = HOURS[line]
+    df["hours"] = df["decision_h"] if (line == "open" and "decision_h" in df) else HOURS[line]
     df = df.dropna(subset=[*cols, "p_pm"])
     f, idx = METHODS[method], {"H": 0, "D": 1, "A": 2}
     df["p_book"] = [f([r[cols[0]], r[cols[1]], r[cols[2]]])[idx[r.outcome]] for _, r in df.iterrows()]
@@ -218,13 +221,50 @@ def _solo_fails(s):
     return g["n"] >= MIN_SOLO_N and g["roi"] < 0
 
 
-def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), spreads=SPREADS):
+def _rule_pin(d, preds, cfg):
+    """Regla sin modelo: Pinnacle directa como probabilidad, mismo umbral, mismo periodo OOS."""
+    p = np.where(np.isnan(preds), np.nan, d.p_book.values)
+    t = simulate(d, p, cfg)
+    m = ~np.isnan(p)
+    return {"n": len(t), "roi": float(t.pnl.sum() / t.stake.sum()) if len(t) else 0.0,
+            "roi_ci95": _boot_ci((t.pnl / t.stake).values) if len(t) > 30 else None,
+            "signals_per_week": weekly(t, d.ts[m].min(), d.ts[m].max())["mean"]}
+
+
+def funnel(df, cfg, trades_open, coverage=None):
+    """Embudo por liga (línea de apertura): emparejados -> mercado vivo a T-24h -> volumen -> señal neta."""
+    df = df.copy()
+    if "league" not in df:
+        df["league"] = "?"
+    pcol = "p_pm_open" if "p_pm_open" in df else "p_pm"
+    vcol = "vol_open" if "vol_open" in df else "vol_before"
+    g = df.groupby("league")
+    out = pd.DataFrame({"emparejados": g.match_id.nunique()})
+    if coverage is not None:
+        out["emparejados"] = coverage.set_index("league").matched.reindex(out.index).fillna(out.emparejados)
+    live = df[df[pcol].notna()]
+    out["vivo_T-24h"] = live.groupby("league").match_id.nunique()
+    vol = live[vcol] if vcol in live else pd.Series(np.inf, index=live.index)
+    out["supera_volumen"] = live[vol >= cfg.min_volume].groupby("league").match_id.nunique()
+    known = live[vol.notna()].match_id.unique()
+    out["vol_desconocido"] = live[vol.isna() & ~live.match_id.isin(known)].groupby("league").match_id.nunique()
+    sig = df[df.match_id.isin(set(trades_open.match_id) if len(trades_open) else set())]
+    out["con_señal_neta"] = sig.groupby("league").match_id.nunique()
+    out = out.fillna(0).astype(int)
+    out["T-24h_viable"] = out.supera_volumen >= FUNNEL_MIN
+    return out
+
+
+def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), spreads=SPREADS, coverage=None):
     """res[(line, método, nivel_spread)] -> resumen. Nivel 'cal' = tabla calibrada si se pasa."""
     source = check_single_source(df)
     levels = [(f"{h:.2f}", replace(cfg, half_spread=h, spread_table=None)) for h in spreads]
     if cfg.spread_table:
         levels.append(("cal", cfg))
-    res, guard = {}, {}
+    base_level = "cal" if cfg.spread_table else levels[0][0]
+    dh = int(df["decision_h"].iloc[0]) if "decision_h" in df else int(HOURS["open"])
+    horizons = {**HORIZON, "open": f"apertura T-24h..T-72h, decisión PM a T-{dh}h"}
+    res, guard, funnel_trades = {}, {}, pd.DataFrame()
     for line in LINES:
         if df[list(LINES[line])].isna().all().all():
             continue
@@ -233,9 +273,13 @@ def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), sp
             preds, blocks = predict_oos(d, cfg)
             guard[(line, meth)] = guardrail(d, preds)
             for name, c in levels:
-                res[(line, meth, name)] = summarize(d, preds, simulate(d, preds, c), blocks, c,
-                                                    simulate(d, preds, c, unknown_volume=True))
-                res[(line, meth, name)]["horizon"] = HORIZON[line]
+                t = simulate(d, preds, c)
+                s = summarize(d, preds, t, blocks, c, simulate(d, preds, c, unknown_volume=True))
+                s["horizon"] = horizons[line]
+                s["regla_pin"] = _rule_pin(d, preds, c)
+                res[(line, meth, name)] = s
+                if (line, meth, name) == ("open", methods[0], base_level):
+                    funnel_trades = t
     v = {"edge_dies_at_half_spread": {}, "method_sensitive": {}, "guardrail": {}}
     for (line, meth), g in guard.items():
         lv = [n for n, _ in levels if (line, meth, n) in res]
@@ -248,28 +292,57 @@ def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), sp
             v["method_sensitive"][f"{line}@{n}"] = round(100 * (max(rois) - min(rois)), 2)
     v["method_sensitive_any"] = any(x > 1.0 for x in v["method_sensitive"].values())
     v["guardrail_warning"] = [k for k, g in v["guardrail"].items() if g["model_worse_than_book"]]
+
     base = ("0.01", "cal")
     opn = [s for (l, _, n), s in res.items() if l == "open" and n in base]
     cls = [s for (l, _, n), s in res.items() if l == "close" and n in base]
-    open_alive = [s for s in opn if _alive(s)]
+    big = lambda s: s["signals"] >= MIN_BETS
+    v["min_bets"] = MIN_BETS
+    v["bets_open_max"] = max((s["signals"] for s in opn), default=0)
     v["solo_modelo_fails_open"] = any(_solo_fails(s) for s in opn)
     v["solo_modelo_small_open"] = any(s["groups"]["solo_modelo"]["n"] < MIN_SOLO_N for s in opn)
-    if open_alive and not v["solo_modelo_fails_open"]:
-        verdict = "candidata (edge en apertura)"
-        if v["solo_modelo_small_open"]:
-            verdict += f" [solo_modelo con n<{MIN_SOLO_N}: no evaluable]"
-    elif open_alive:
+    open_alive = [s for s in opn if _alive(s) and big(s)]
+    if open_alive and v["solo_modelo_fails_open"]:
         verdict = "no candidata (solo_modelo pierde en apertura: el blend fabrica señales)"
-    elif any(_alive(s) for s in cls):
+    elif open_alive and v["solo_modelo_small_open"]:
+        verdict = f"no evaluable (solo_modelo con n<{MIN_SOLO_N} en apertura)"
+    elif open_alive:
+        verdict = "candidata (edge en apertura)"
+    elif any(_alive(s) for s in opn) or not any(big(s) for s in opn):
+        verdict = f"no evaluable (menos de {MIN_BETS} apuestas en apertura)"
+    elif any(_alive(s) and big(s) for s in cls):
         verdict = "solo investigación (edge solo en cierre)"
+    elif any(_alive(s) for s in cls):
+        verdict = f"no evaluable (edge solo en cierre con menos de {MIN_BETS} apuestas)"
     else:
         verdict = "sin edge"
+
+    rec = []
+    if v["solo_modelo_small_open"]:
+        ok = [s for s in opn if s["groups"]["con_pinnacle"]["roi_ci95"] and s["groups"]["con_pinnacle"]["roi_ci95"][0] > 0]
+        if ok:
+            r = ok[0]["regla_pin"]
+            rec.append(
+                "solo_modelo no es evaluable y con_pinnacle funciona: quitar la regresión y usar Pinnacle "
+                "directa como regla de umbral (p_book frente al ask, mismo min_edge). "
+                f"ROI de esa regla sin modelo en este backtest: {100 * r['roi']:.1f}% con {r['n']} apuestas "
+                f"(IC95 {[round(100 * x, 1) for x in r['roi_ci95']] if r['roi_ci95'] else 'n<30'}).")
+        rec.append("El ROI de con_pinnacle NO es el ROI de la regla sin modelo: esas señales las elige y "
+                   "dimensiona el modelo (Kelly sobre p_modelo) y dependen de su umbral; la regla pura es la "
+                   "columna 'regla_pin'.")
+    v["recommendation"] = rec
+
     v["source"] = source
-    if source and source != VALID_BOOK:
-        verdict += (" | NO VÁLIDO: Max infla el edge" if source == "Max" else
-                    f" | referencia ({source}), no veredicto: solo la pista A con Pinnacle es válida")
+    if source == "Max" or source in INVALID_BOOKS:
+        verdict += f" | NO VÁLIDO: pista C ({source})" + (", Max infla el edge" if source == "Max" else "")
+    elif source and source != VALID_BOOK:
+        verdict += f" | referencia ({source}), no veredicto: solo la pista A con Pinnacle es válida"
     v["verdict"] = verdict
-    v["horizons"] = HORIZON
+    v["horizons"] = horizons
+    fn = funnel(df, cfg, funnel_trades, coverage)
+    v["funnel"] = fn.reset_index().to_dict("records")
+    v["funnel_level"] = f"open/{methods[0]}@{base_level}"
+    v["funnel_not_viable"] = [l for l, ok in fn["T-24h_viable"].items() if not ok]
     return res, v
 
 
@@ -285,6 +358,7 @@ def table(res) -> pd.DataFrame:
             "ci95%": [round(100 * x, 1) for x in s["roi_ci95"]] if s["roi_ci95"] else None,
             "solo_mod n/roi%": f'{g["solo_modelo"]["n"]}/{100 * g["solo_modelo"]["roi"]:.1f}',
             "con_pin n/roi%": f'{g["con_pinnacle"]["n"]}/{100 * g["con_pinnacle"]["roi"]:.1f}',
+            "regla_pin n/roi%": f'{s["regla_pin"]["n"]}/{100 * s["regla_pin"]["roi"]:.1f}' if "regla_pin" in s else "-",
             "vol? n/roi%": (f'{s["unknown_volume"]["signals"]}/{100 * s["unknown_volume"]["roi"]:.1f}'
                             if "unknown_volume" in s else "-"),
             "beats_pm": s["beats_pm"], "beats_book": s["beats_book"],

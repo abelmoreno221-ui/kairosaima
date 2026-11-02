@@ -11,14 +11,15 @@ Busca partidos de fútbol en los que el precio de Polymarket no coincide con la 
 - **Tipo de bloqueo:** es una orden de la DGOJ a los proveedores de internet, no un geobloqueo de Polymarket. España no aparece en la [lista de restricciones geográficas de Polymarket](https://help.polymarket.com/en/articles/13364163-geographic-restrictions).
 - **Comisiones:** [Trading fees (Polymarket)](https://help.polymarket.com/en/articles/13364478-trading-fees).
 
-### Pistas de datos (nunca se mezclan fuentes)
+### Pistas de datos (una pista = una casa; nunca se cambia de casa)
 | Pista | Temporada | Referencia | Validez |
 |---|---|---|---|
 | **A** | 25/26 hasta el 08/01/2026 | Pinnacle (`PSH/PSD/PSA`, cierre `PSC*`) | **Único veredicto válido.** Pinnacle desaparece de football-data el 08/01/2026 (210 de 380 partidos en 25/26) |
-| **B** | 26/27 | Betfair Exchange (`BFEH/BFED/BFEA`, cierre `BFEC*`) | Solo referencia: no hay Pinnacle |
+| **B** | 26/27 | Betfair Exchange (`BFEH/BFED/BFEA`, cierre `BFEC*`) | Solo referencia |
+| **C** | 25/26 + 26/27 | `Avg` (o `Max` con `--book Max`) | **Inválida**, solo diagnóstico. `Max` es un outlier por construcción e infla el edge |
 
-- Si la casa de la pista no está en **todos** los ficheros, se pasa a otra para la pista entera, primero `Avg` y luego `Max`. `Max` es el último recurso porque es un outlier por construcción e infla el edge; si se usa, el resultado sale marcado como no válido.
-- El backtest se aborta si el dataset mezcla casas.
+- **Fallback por descarte de filas:** se tiran las filas a las que les falta alguna de las seis cuotas de la casa de la pista (apertura o cierre), y el log cuenta cuántas. Si no queda ninguna, se aborta. El backtest también se aborta si un dataset mezcla casas.
+- **Betfair Exchange:** es un exchange, no una casa. No tiene margen en la cuota; cobra una comisión del 5 % sobre la ganancia neta, rebajable al 2 %. En 25/26 hay 22 partidos sin cierre de BFE, que se descartan.
 
 ### Horizontes
 - **Apertura de football-data:** se recoge los viernes y martes por la tarde, así que equivale a **T-24h a T-72h** del saque. El backtest con esta línea toma el precio y el volumen de Polymarket a **T-24h**, y el escáner decide también a **T-24h** (±1h).
@@ -41,6 +42,8 @@ Busca partidos de fútbol en los que el precio de Polymarket no coincide con la 
 pip install -r requirements.txt
 python -m pmarb build --track A     # 25/26 Pinnacle hasta 08/01/2026 -> dataset_A.csv (aborta si la cobertura es baja)
 python -m pmarb build --track B     # 26/27 Betfair Exchange           -> dataset_B.csv
+python -m pmarb build --track C --book Avg   # diagnóstico, inválida
+python -m pmarb build --track A --decision-h 6   # si el embudo marca T-24h como no viable
 python -m pmarb spreads sample      # cada hora, 1-2 semanas; solo mercados a <48h del saque
 python -m pmarb spreads summary     # -> spread_table.json (mediana del medio spread por precio x horas al saque)
 python -m pmarb backtest dataset_A.csv --spread-table spread_table.json   # veredicto
@@ -50,6 +53,15 @@ python -m unittest discover -s tests -t .
 La cobertura de fútbol de Polymarket empieza en 2025, por eso solo se usan 25/26 y 26/27.
 
 ## Cómo leer el resultado
+- **Embudo por liga (diagnóstico principal):** cuatro escalones, siempre sobre la línea de apertura:
+  1. partidos emparejados,
+  2. partidos con mercado vivo a T-24h,
+  3. partidos que superan el filtro de volumen (los de volumen desconocido van en columna aparte),
+  4. partidos con señal neta (solo en el periodo fuera de muestra).
+
+  Si el tercer escalón deja **menos de 20 partidos en una liga**, esa liga sale marcada: el horizonte T-24h no es viable ahí y hay que reconstruir con `--decision-h 6`.
+- **Suelo de muestra:** con menos de **150 apuestas colocadas**, ningún veredicto pasa de "no evaluable", aunque el IC salga limpio.
+- **`regla_pin`:** la regla sin modelo, es decir, Pinnacle directa frente al ask con el mismo umbral y el mismo periodo. **No es lo mismo que el grupo `con_pinnacle`**: esas señales las elige y las dimensiona el modelo. Si `solo_modelo` no es evaluable (menos de 30 señales) y `con_pinnacle` funciona, el informe recomienda quitar la regresión y usar esta regla.
 - **`sig/wk`, `sig/wk_med` y `zero_wks`:** la cifra que decide el proyecto. Señales netas después de comisión, medio spread y volumen previo mínimo.
 - **`half_spr`:** es **medio** spread en $ por acción. Comprar como taker cuesta `mid + half_spr` y se paga al entrar. `edge_dies_at_half_spread` es el primer nivel en el que el IC 95 % del ROI deja de quedar por encima de 0. El nivel `cal` usa la tabla medida con `spreads`.
 - **Cierre frente a apertura:** el cierre no se conoce al decidir, así que solo vale como investigación. El veredicto es "estrategia candidata" únicamente si hay edge en apertura.
@@ -58,7 +70,7 @@ La cobertura de fútbol de Polymarket empieza en 2025, por eso solo se usan 25/2
   - `con_pinnacle`: la casa sola ya dispara la misma operación.
   - `solo_modelo`: la señal existe solo porque el blend se separa también de la casa.
   
-  Se reportan ROI y Brier de cada grupo. Si `solo_modelo` pierde (ROI < 0 con al menos 30 señales) en la línea de apertura, el veredicto **baja a "no candidata"**. Con menos de 30 señales se marca como no evaluable.
+  Se reportan ROI y Brier de cada grupo. Si `solo_modelo` pierde (ROI < 0 con al menos 30 señales) en la línea de apertura, el veredicto **baja a "no candidata"**. Con menos de 30 señales, el veredicto es "no evaluable".
 - **Guardarraíl:** diferencia de Brier entre modelo y casa, con IC 95 % por bootstrap de partidos. Si el modelo es peor que la casa más allá del IC, sale un aviso (`guardrail_warning`).
 - **Volumen desconocido:** sale en una línea aparte (filas, señales por semana, ROI), fuera de las cifras principales. Suelen ser los mercados más líquidos.
 - **Aborta sin dar cifras** si hay pocos partidos emparejados (`--min-coverage`, `--min-matches`).
