@@ -7,17 +7,33 @@ import pandas as pd
 from .http import get_json
 
 
-def load_football_data(path_or_url: str) -> pd.DataFrame:
-    """Devuelve cuotas de cierre (oH/oD/oA <- PSCH/PSCD/PSCA) y apertura (ooH/ooD/ooA <- PSH/PSD/PSA).
-    La apertura es el proxy de lo disponible a ~T-6h; el cierre no existe en el momento de decidir."""
+FD_URL = "https://www.football-data.co.uk/mmz4281/{season}/{league}.csv"
+BOOKS = {"PS": "Pinnacle", "Avg": "media del mercado", "Max": "máximo del mercado", "B365": "Bet365"}
+
+
+def fd_urls(seasons=("2526", "2627"), leagues=("E0", "SP1", "I1", "D1", "F1")):
+    return [FD_URL.format(season=s, league=l) for s in seasons for l in leagues]
+
+
+def load_football_data(path_or_url: str, book="PS") -> pd.DataFrame:
+    """Cierre (oH/oD/oA <- {book}CH/CD/CA) y apertura (ooH/ooD/ooA <- {book}H/D/A).
+    La apertura es el proxy de lo disponible antes del partido; el cierre no existe al decidir.
+    Si el fichero no trae columnas de esa casa, falla con las alternativas disponibles."""
     df = pd.read_csv(path_or_url, encoding="latin-1")
+    ren = {f"{book}CH": "oH", f"{book}CD": "oD", f"{book}CA": "oA",
+           f"{book}H": "ooH", f"{book}D": "ooD", f"{book}A": "ooA"}
+    have = [c for c in ren if c in df]
+    if not have or df[have].notna().sum().sum() == 0:
+        alt = [b for b in BOOKS if f"{b}H" in df and df[f"{b}H"].notna().any()]
+        raise SystemExit(f"{path_or_url}: sin cuotas de {BOOKS.get(book, book)} ({book}*). "
+                         f"Disponibles: {alt}. Usa --book con una de ellas.")
     df["date"] = pd.to_datetime(df["Date"], dayfirst=True).dt.date
-    ren = {"PSCH": "oH", "PSCD": "oD", "PSCA": "oA", "PSH": "ooH", "PSD": "ooD", "PSA": "ooA"}
     df = df.rename(columns=ren)
     for c in ren.values():
         if c not in df:
             df[c] = float("nan")
-    return df[["date", "HomeTeam", "AwayTeam", "FTR", *ren.values()]].dropna(subset=["FTR"])
+    df["league"] = df.get("Div", "?")
+    return df[["date", "league", "HomeTeam", "AwayTeam", "FTR", *ren.values()]].dropna(subset=["FTR"])
 
 
 def odds_api_live(sport="soccer_epl", bookmaker="pinnacle", api_key=None):

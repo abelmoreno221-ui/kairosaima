@@ -54,3 +54,63 @@ def top_of_book(token_id: str):
     bids = sorted((float(x["price"]), float(x["size"])) for x in b.get("bids", []))
     asks = sorted((float(x["price"]), float(x["size"])) for x in b.get("asks", []))
     return {"bid": bids[-1] if bids else None, "ask": asks[0] if asks else None}
+
+
+# ---------- Data API: trades (liquidez sin lookahead) ----------
+import hashlib
+import os
+import time as _time
+
+DATA = "https://data-api.polymarket.com"
+CACHE_DIR = os.environ.get("PMARB_CACHE", ".cache")
+_MIN_INTERVAL = float(os.environ.get("PMARB_MIN_INTERVAL", "0.25"))  # s entre llamadas (~4 req/s)
+_last = [0.0]
+
+
+def _throttle():
+    wait = _MIN_INTERVAL - (_time.monotonic() - _last[0])
+    if wait > 0:
+        _time.sleep(wait)
+    _last[0] = _time.monotonic()
+
+
+def trades(condition_id: str, page=500, max_offset=10000):
+    """Todos los trades de un mercado (una vez por mercado, cacheado en disco)."""
+    path = os.path.join(CACHE_DIR, "trades", hashlib.sha1(condition_id.encode()).hexdigest() + ".json")
+    if os.path.exists(path):
+        return json.load(open(path))
+    out = []
+    for off in range(0, max_offset, page):
+        _throttle()
+        batch = get_json(f"{DATA}/trades", {"market": condition_id, "limit": page, "offset": off})
+        if not batch:
+            break
+        out += [{"t": int(x["timestamp"]), "usd": float(x["size"]) * float(x["price"])} for x in batch]
+        if len(batch) < page:
+            break
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(out, open(path, "w"))
+    return out
+
+
+def volume_before(trade_list, ts: int) -> float:
+    """USDC negociados con timestamp < ts (estricto: nada posterior a la señal)."""
+    return float(sum(x["usd"] for x in trade_list if x["t"] < ts))
+
+
+def spread(token_id: str):
+    _throttle()
+    return float(get_json(f"{CLOB}/spread", {"token_id": token_id}).get("spread", "nan"))
+
+
+def book_snapshot(token_id: str, depth_cents=0.02):
+    _throttle()
+    b = get_json(f"{CLOB}/book", {"token_id": token_id})
+    bids = sorted(((float(x["price"]), float(x["size"])) for x in b.get("bids", [])), reverse=True)
+    asks = sorted((float(x["price"]), float(x["size"])) for x in b.get("asks", []))
+    if not bids or not asks:
+        return None
+    bb, ba = bids[0][0], asks[0][0]
+    return {"bid": bb, "ask": ba, "mid": (bb + ba) / 2, "book_spread": ba - bb,
+            "bid_size": bids[0][1], "ask_size": asks[0][1],
+            "ask_depth_usd": sum(p * s for p, s in asks if p <= ba + depth_cents)}
