@@ -42,6 +42,28 @@ def check_scope(track: str, seasons, leagues):
         raise SystemExit("La pista A es solo --seasons 2526: 26/27 no tiene PSH y no aporta filas.")
 
 
+def resolve_fd(paths, leagues=LEAGUES):
+    """--fd acepta ficheros o una carpeta. En una carpeta busca un CSV por liga ({liga}.csv o que
+    empiece por la liga, p. ej. 'E0 (1).csv' de una descarga del navegador). Falla si falta alguna."""
+    import glob
+    import os
+    out = []
+    for p in paths:
+        if not os.path.isdir(p):
+            out.append(p)
+            continue
+        files = sorted(glob.glob(os.path.join(p, "*.csv")))
+        missing = []
+        for lg in leagues:
+            hit = [f for f in files if os.path.basename(f).upper().startswith(lg.upper())
+                   and not os.path.basename(f).upper().startswith(lg.upper() + "_")]
+            exact = [f for f in hit if os.path.basename(f).upper() == f"{lg.upper()}.CSV"]
+            (out.append((exact or hit)[0]) if hit else missing.append(lg))
+        if missing:
+            raise SystemExit(f"{p}: faltan CSV de {missing}. Descárgalos de football-data (temporada 2526).")
+    return out
+
+
 def fd_urls(seasons=("2526",), leagues=LEAGUES):
     return [FD_URL.format(season=s, league=l) for s in seasons for l in leagues]
 

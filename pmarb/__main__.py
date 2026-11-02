@@ -15,7 +15,7 @@ def main():
                         "C: Avg/Max (inválida, diagnóstico)")
     b.add_argument("--book", choices=["Avg", "Max"], help="solo pista C (por defecto Avg)")
     b.add_argument("--seasons", nargs="+", help="sobrescribe las temporadas de la pista (p. ej. 2526 2627)")
-    b.add_argument("--fd", nargs="*", help="CSV locales de la temporada de la pista; si no, se descargan")
+    b.add_argument("--fd", nargs="*", help="CSV locales o carpeta con E0/SP1/D1/I1/F1 de la temporada; si no, se descargan")
     b.add_argument("--leagues", nargs="+", default=["E0", "SP1", "D1", "I1", "F1"])
     b.add_argument("--tag", default="soccer")
     b.add_argument("--vol-window-h", type=int, default=168, help="ventana de volumen previo a cada decisión")
@@ -51,7 +51,8 @@ def main():
 
     if a.cmd == "build":
         from .dataset import build
-        from .odds import load_football_data, fd_urls, TRACKS, check_scope
+        from .odds import load_football_data, fd_urls, TRACKS, check_scope, resolve_fd
+        from .http import STATS
         tr = TRACKS[a.track]
         print(f"Pista {a.track}: {tr['note']}")
         if a.book and a.track != "C":
@@ -59,18 +60,25 @@ def main():
         book = a.book or tr["book"]
         seasons = a.seasons or tr["seasons"]
         check_scope(a.track, seasons, a.leagues)
-        fd = load_football_data(a.fd or fd_urls(seasons, a.leagues), book, tr["until"])
+        fd = load_football_data(resolve_fd(a.fd, a.leagues) if a.fd else fd_urls(seasons, a.leagues), book, tr["until"])
         out = a.out if a.out != "dataset.csv" else f"dataset_{a.track}.csv"
         drops = fd.attrs["drops"]
         if fd.attrs["absent"]:
             drops = pd.concat([drops, pd.DataFrame([{**x, "pattern": "columna ausente"} for x in fd.attrs["absent"]])])
         drops.to_csv(out.replace(".csv", ".drops.csv"), index=False)
-        ds, cov = build(fd, a.tag, vol_window_h=a.vol_window_h, min_rate=a.min_coverage, min_matches=a.min_matches)
+        from .dataset import LowCoverage
+        try:
+            ds, cov = build(fd, a.tag, vol_window_h=a.vol_window_h, min_rate=a.min_coverage, min_matches=a.min_matches)
+        except LowCoverage:
+            print(f"API: {STATS['calls']} llamadas, {STATS['retries']} reintentos, {STATS['errors']} errores")
+            raise
         ds.to_csv(out, index=False)
         cov.to_csv(out.replace(".csv", ".coverage.csv"), index=False)
         print("\n=== PASO 1: leer solo esto ===")
         print(cov.to_string(index=False))
         print(f"TOTAL emparejados: {int(cov.matched.sum())} (mínimo 150 para seguir al backtest)")
+        print(f"API: {STATS['calls']} llamadas, {STATS['retries']} reintentos, {STATS['errors']} errores "
+              "(detalle en las líneas HTTP-RETRY / HTTP-ERROR del log)")
         for _, r in drops.fillna("").iterrows():
             if r.pattern == "columna ausente":
                 print(f"  {r.file}: COLUMNA AUSENTE {r.missing}")

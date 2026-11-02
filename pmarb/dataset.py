@@ -44,7 +44,11 @@ def coverage(fd: pd.DataFrame, events: list, min_rate=0.30, min_matches=150, log
 def build(fd: pd.DataFrame, tag_slug="soccer", vol_window_h=168, kickoff_utc_hour=12,
           min_rate=0.30, min_matches=150, log=print):
     """Devuelve (dataset, cobertura_por_liga). Columnas ts_/p_pm_/vol_ para cada punto de POINTS."""
-    matched = coverage(fd, list(pm.iter_events(tag_slug, closed=True)), min_rate, min_matches, log)
+    lo = (pd.Timestamp(fd.date.min()) - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+    hi = (pd.Timestamp(fd.date.max()) + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+    evs = list(pm.iter_events(tag_slug, closed=True, start=lo, end=hi))
+    log(f"Eventos Polymarket '{tag_slug}' cerrados entre {lo} y {hi}: {len(evs)}")
+    matched = coverage(fd, evs, min_rate, min_matches, log)
     W = vol_window_h * 3600
     rows = []
     for k, r in matched.iterrows():

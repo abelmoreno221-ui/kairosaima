@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pmarb"
+version = "0.1.0"
+description = "Polymarket vs casas: calibración, backtest walk-forward y señales en papel (solo lectura)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "pandas>=2.0"]
+
+[tool.setuptools]
+packages = ["pmarb"]
