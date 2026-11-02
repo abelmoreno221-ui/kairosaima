@@ -1,8 +1,13 @@
 """Backtest walk-forward (sin lookahead): rejilla línea {close, open} x de-vig {shin, prop, log}
 x medio spread {1, 2, 3, 5 céntimos [, calibrado]}.
 
-Dataset: ts, match_id, outcome (H/D/A), p_pm (precio YES ~ mid), y, oH/oD/oA (cierre),
-ooH/ooD/ooA (apertura), vol_before (USDC negociados en el mercado ANTES de ts).
+Dataset: match_id, source, outcome (H/D/A), y, cuotas oH/oD/oA (cierre) y ooH/ooD/ooA (apertura),
+y por punto de decisión: ts_open/p_pm_open/vol_open (T-24h) y ts_close/p_pm_close/vol_close (T-10min).
+
+Horizontes:
+- open:  apertura de football-data (viernes/martes tarde = T-24h a T-72h); decisión en PM a T-24h.
+- close: cierre al saque; decisión a T-10min. No existe al decidir -> solo investigación.
+Una fuente por backtest: si el dataset mezcla casas (p. ej. PS y BFE), se aborta.
 
 Convenciones de costes (verificadas en tests):
 - half_spread = MEDIO spread: comprar como taker cuesta ask = mid + half_spread, se paga al entrar.
@@ -18,6 +23,9 @@ from .devig import METHODS
 from .model import Blend, brier, report
 
 LINES = {"close": ("oH", "oD", "oA"), "open": ("ooH", "ooD", "ooA")}
+HOURS = {"open": 24.0, "close": 10 / 60}
+HORIZON = {"open": "apertura T-24h..T-72h, decisión PM a T-24h", "close": "cierre al saque, decisión a T-10min"}
+VALID_BOOK = "PS"
 SPREADS = (0.01, 0.02, 0.03, 0.05)
 
 
@@ -26,7 +34,7 @@ class Cfg:
     min_train: int = 300
     step: int = 100
     half_spread: float = 0.01      # MEDIO spread en $ por acción (no el spread completo)
-    spread_table: tuple | None = None  # ((lo, hi, half), ...) por tramo de precio, de `spreads summary`
+    spread_table: tuple | None = None  # ((p_lo, p_hi, h_lo, h_hi, half), ...) de `spreads summary`
     fee_rate: float = 0.05
     min_edge: float = 0.04         # EV neto mínimo por $ apostado, sobre el ask, tras fee
     min_volume: float = 1000.0     # USDC negociados en el mercado antes de la señal
@@ -41,19 +49,21 @@ def fee_per_share(c, rate):
     return rate * c * (1 - c)
 
 
-def half_spread_at(mid, cfg: Cfg):
+def half_spread_at(mid, cfg: Cfg, hours=None):
+    """Medio spread por tramo de precio x horas al saque. Celda sin datos -> el peor de la tabla."""
     if cfg.spread_table:
-        for lo, hi, h in cfg.spread_table:
-            if lo <= mid < hi:
-                return h
+        for p_lo, p_hi, h_lo, h_hi, half in cfg.spread_table:
+            if p_lo <= mid < p_hi and (hours is None or h_lo <= hours < h_hi):
+                return half
+        return max(x[4] for x in cfg.spread_table)
     return cfg.half_spread
 
 
-def decide(p, mid, cfg: Cfg):
+def decide(p, mid, cfg: Cfg, hours=None):
     """(lado, ask, ev_neto_por_$, prob_lado) o None. Compra YES o NO como taker al ask."""
     best = None
     for side, q, m in (("YES", p, mid), ("NO", 1 - p, 1 - mid)):
-        ask = min(m + half_spread_at(m, cfg), 0.99)
+        ask = min(m + half_spread_at(m, cfg, hours), 0.99)
         ev = (q - ask - fee_per_share(ask, cfg.fee_rate)) / ask   # sobre el precio de compra
         if best is None or ev > best[2]:
             best = (side, ask, ev, q)
@@ -67,9 +77,21 @@ def settle(stake, ask, won, rate):
     return shares * won - stake - fee, fee
 
 
+def check_single_source(df):
+    src = set(df["source"].dropna()) if "source" in df else set()
+    if len(src) > 1:
+        raise SystemExit(f"ABORTADO: el dataset mezcla fuentes {sorted(src)}. Una pista, una fuente.")
+    return next(iter(src), None)
+
+
 def with_book(df: pd.DataFrame, line="close", method="shin") -> pd.DataFrame:
+    """Fija el punto de decisión de la línea (ts, p_pm, vol_before, hours) y añade p_book."""
     cols = LINES[line]
-    df = df.dropna(subset=list(cols)).copy()
+    df = df.copy()
+    if f"p_pm_{line}" in df:
+        df["ts"], df["p_pm"], df["vol_before"] = df[f"ts_{line}"], df[f"p_pm_{line}"], df[f"vol_{line}"]
+    df["hours"] = HOURS[line]
+    df = df.dropna(subset=[*cols, "p_pm"])
     f, idx = METHODS[method], {"H": 0, "D": 1, "A": 2}
     df["p_book"] = [f([r[cols[0]], r[cols[1]], r[cols[2]]])[idx[r.outcome]] for _, r in df.iterrows()]
     return df.sort_values("ts").reset_index(drop=True)
@@ -88,13 +110,19 @@ def predict_oos(df: pd.DataFrame, cfg: Cfg):
     return preds, blocks
 
 
-def simulate(df: pd.DataFrame, preds, cfg: Cfg) -> pd.DataFrame:
+def simulate(df: pd.DataFrame, preds, cfg: Cfg, unknown_volume=False) -> pd.DataFrame:
+    """unknown_volume=False: solo filas con volumen conocido >= min_volume.
+    unknown_volume=True: solo filas con volumen desconocido (se reportan aparte, banca propia)."""
     bank, rows = cfg.bankroll, []
-    vol = df["vol_before"].values if "vol_before" in df else np.full(len(df), np.inf)
+    vol = df["vol_before"].values.astype(float) if "vol_before" in df else np.full(len(df), np.inf)
+    hours = df["hours"].values if "hours" in df else np.full(len(df), np.nan)
     for i, r in enumerate(df.itertuples()):
-        if np.isnan(preds[i]) or vol[i] < cfg.min_volume:
+        if np.isnan(preds[i]):
             continue
-        d = decide(preds[i], r.p_pm, cfg)
+        if unknown_volume != bool(np.isnan(vol[i])) or (not unknown_volume and vol[i] < cfg.min_volume):
+            continue
+        h = None if np.isnan(hours[i]) else hours[i]
+        d = decide(preds[i], r.p_pm, cfg, h)
         if not d:
             continue
         side, ask, ev, q = d
@@ -104,7 +132,7 @@ def simulate(df: pd.DataFrame, preds, cfg: Cfg) -> pd.DataFrame:
         won = int(r.y == (1 if side == "YES" else 0))
         pnl, fee = settle(stake, ask, won, cfg.fee_rate)
         bank += pnl
-        bd = decide(r.p_book, r.p_pm, cfg)
+        bd = decide(r.p_book, r.p_pm, cfg, h)
         q_book = r.p_book if side == "YES" else 1 - r.p_book
         rows.append({"ts": r.ts, "match_id": r.match_id, "side": side, "ask": ask, "p_model": q,
                      "p_book": q_book, "won": won, "ev": ev, "stake": stake, "fee": fee, "pnl": pnl,
@@ -151,7 +179,7 @@ def guardrail(df, preds):
     return {"brier_diff": float(per_match.mean()), "ci95": ci, "model_worse_than_book": ci[0] > 0}
 
 
-def summarize(df, preds, t, blocks, cfg):
+def summarize(df, preds, t, blocks, cfg, t_unknown=None):
     m = ~np.isnan(preds)
     oos = df[m]
     ll = {"pm": report(oos.p_pm, oos.y)["logloss"], "book": report(oos.p_book, oos.y)["logloss"],
@@ -162,6 +190,11 @@ def summarize(df, preds, t, blocks, cfg):
          "roi_ci95": _boot_ci((t.pnl / t.stake).values) if len(t) > 30 else None,
          "fees_paid": float(t.fee.sum()) if len(t) else 0.0, "final_bank": round(float(cfg.bankroll + (t.pnl.sum() if len(t) else 0)), 2),
          "groups": groups(t), "blocks": blocks, "cfg": asdict(cfg)}
+    if t_unknown is not None:
+        s["unknown_volume"] = {"signals": len(t_unknown),
+                               "signals_per_week": weekly(t_unknown, oos.ts.min(), oos.ts.max())["mean"],
+                               "roi": float(t_unknown.pnl.sum() / t_unknown.stake.sum()) if len(t_unknown) else 0.0,
+                               "markets": int(df[m].vol_before.isna().sum()) if "vol_before" in df else 0}
     return s
 
 
@@ -169,15 +202,25 @@ def run(df: pd.DataFrame, cfg: Cfg = Cfg()):
     df = df.sort_values("ts").reset_index(drop=True)
     preds, blocks = predict_oos(df, cfg)
     t = simulate(df, preds, cfg)
-    return summarize(df, preds, t, blocks, cfg), t
+    return summarize(df, preds, t, blocks, cfg, simulate(df, preds, cfg, unknown_volume=True)), t
 
 
 def _alive(s):
     return bool(s["roi_ci95"] and s["roi_ci95"][0] > 0 and s["beats_pm"])
 
 
+MIN_SOLO_N = 30
+
+
+def _solo_fails(s):
+    """solo_modelo pierde (ROI < 0) con muestra suficiente."""
+    g = s["groups"]["solo_modelo"]
+    return g["n"] >= MIN_SOLO_N and g["roi"] < 0
+
+
 def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), spreads=SPREADS):
     """res[(line, método, nivel_spread)] -> resumen. Nivel 'cal' = tabla calibrada si se pasa."""
+    source = check_single_source(df)
     levels = [(f"{h:.2f}", replace(cfg, half_spread=h, spread_table=None)) for h in spreads]
     if cfg.spread_table:
         levels.append(("cal", cfg))
@@ -190,7 +233,9 @@ def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), sp
             preds, blocks = predict_oos(d, cfg)
             guard[(line, meth)] = guardrail(d, preds)
             for name, c in levels:
-                res[(line, meth, name)] = summarize(d, preds, simulate(d, preds, c), blocks, c)
+                res[(line, meth, name)] = summarize(d, preds, simulate(d, preds, c), blocks, c,
+                                                    simulate(d, preds, c, unknown_volume=True))
+                res[(line, meth, name)]["horizon"] = HORIZON[line]
     v = {"edge_dies_at_half_spread": {}, "method_sensitive": {}, "guardrail": {}}
     for (line, meth), g in guard.items():
         lv = [n for n, _ in levels if (line, meth, n) in res]
@@ -203,13 +248,28 @@ def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), sp
             v["method_sensitive"][f"{line}@{n}"] = round(100 * (max(rois) - min(rois)), 2)
     v["method_sensitive_any"] = any(x > 1.0 for x in v["method_sensitive"].values())
     v["guardrail_warning"] = [k for k, g in v["guardrail"].items() if g["model_worse_than_book"]]
-    open_ok = any(_alive(s) for (l, _, n), s in res.items() if l == "open" and n in ("0.01", "cal"))
-    close_ok = any(_alive(s) for (l, _, n), s in res.items() if l == "close" and n in ("0.01", "cal"))
-    noise = any(s["groups"]["solo_modelo"]["n"] > 30 and not (s["groups"]["solo_modelo"]["roi_ci95"] or [0])[0] > 0
-                for (l, _, n), s in res.items() if l == "open")
-    v["solo_modelo_fails_open"] = noise
-    v["verdict"] = ("estrategia candidata (edge en apertura)" if open_ok else
-                    "solo investigación (edge solo en cierre)" if close_ok else "sin edge")
+    base = ("0.01", "cal")
+    opn = [s for (l, _, n), s in res.items() if l == "open" and n in base]
+    cls = [s for (l, _, n), s in res.items() if l == "close" and n in base]
+    open_alive = [s for s in opn if _alive(s)]
+    v["solo_modelo_fails_open"] = any(_solo_fails(s) for s in opn)
+    v["solo_modelo_small_open"] = any(s["groups"]["solo_modelo"]["n"] < MIN_SOLO_N for s in opn)
+    if open_alive and not v["solo_modelo_fails_open"]:
+        verdict = "candidata (edge en apertura)"
+        if v["solo_modelo_small_open"]:
+            verdict += f" [solo_modelo con n<{MIN_SOLO_N}: no evaluable]"
+    elif open_alive:
+        verdict = "no candidata (solo_modelo pierde en apertura: el blend fabrica señales)"
+    elif any(_alive(s) for s in cls):
+        verdict = "solo investigación (edge solo en cierre)"
+    else:
+        verdict = "sin edge"
+    v["source"] = source
+    if source and source != VALID_BOOK:
+        verdict += (" | NO VÁLIDO: Max infla el edge" if source == "Max" else
+                    f" | referencia ({source}), no veredicto: solo la pista A con Pinnacle es válida")
+    v["verdict"] = verdict
+    v["horizons"] = HORIZON
     return res, v
 
 
@@ -225,6 +285,8 @@ def table(res) -> pd.DataFrame:
             "ci95%": [round(100 * x, 1) for x in s["roi_ci95"]] if s["roi_ci95"] else None,
             "solo_mod n/roi%": f'{g["solo_modelo"]["n"]}/{100 * g["solo_modelo"]["roi"]:.1f}',
             "con_pin n/roi%": f'{g["con_pinnacle"]["n"]}/{100 * g["con_pinnacle"]["roi"]:.1f}',
+            "vol? n/roi%": (f'{s["unknown_volume"]["signals"]}/{100 * s["unknown_volume"]["roi"]:.1f}'
+                            if "unknown_volume" in s else "-"),
             "beats_pm": s["beats_pm"], "beats_book": s["beats_book"],
             "n_train 1º/últ": f'{s["blocks"][0]["n_train"]}/{s["blocks"][-1]["n_train"]}' if s["blocks"] else "-",
         })

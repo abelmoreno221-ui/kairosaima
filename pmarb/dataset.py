@@ -1,6 +1,10 @@
-"""Dataset histórico: football-data (apertura + cierre de una casa) x Polymarket.
+"""Dataset histórico: football-data (apertura + cierre de UNA casa) x Polymarket.
 Fase 1 (barata): emparejar y medir cobertura -> aborta si es insuficiente.
-Fase 2: precio pre-partido (CLOB) y volumen negociado antes de T (data-api, cacheado por mercado)."""
+Fase 2, dos puntos de decisión por mercado:
+  - apertura: precio PM y volumen a T-24h (la apertura de football-data es de T-24h a T-72h).
+  - cierre:   precio PM y volumen a T-10min (solo investigación).
+Volumen = USDC negociados en los `vol_window_h` previos a cada punto (data-api, una vez por mercado).
+Si /trades se agota antes de cubrir el tramo, el volumen queda NaN (desconocido), no se descarta."""
 from datetime import datetime, time
 import numpy as np
 import pandas as pd
@@ -8,6 +12,7 @@ from . import polymarket as pm
 from .matching import match_event, outcome_of
 
 ODDS = ["oH", "oD", "oA", "ooH", "ooD", "ooA"]
+DECISION_H = 24
 
 
 class LowCoverage(SystemExit):
@@ -33,9 +38,10 @@ def coverage(fd: pd.DataFrame, events: list, min_rate=0.30, min_matches=150, log
     return fd[fd._ev.notna()]
 
 
-def build(fd: pd.DataFrame, tag_slug="soccer", lead_min=10, kickoff_utc_hour=12,
-          min_rate=0.30, min_matches=150, log=print):
+def build(fd: pd.DataFrame, tag_slug="soccer", close_lead_min=10, decision_h=DECISION_H,
+          vol_window_h=168, kickoff_utc_hour=12, min_rate=0.30, min_matches=150, log=print):
     matched = coverage(fd, list(pm.iter_events(tag_slug, closed=True)), min_rate, min_matches, log)
+    W = vol_window_h * 3600
     rows = []
     for k, r in matched.iterrows():
         for m in r._ev.get("markets", []):
@@ -43,16 +49,19 @@ def build(fd: pd.DataFrame, tag_slug="soccer", lead_min=10, kickoff_utc_hour=12,
             if not mk["yes_token"]:
                 continue
             ko = pd.Timestamp(mk["start"]) if mk["start"] else pd.Timestamp(datetime.combine(r.date, time(kickoff_utc_hour)))
-            ko = ko.tz_convert("UTC") if ko.tzinfo else ko.tz_localize("UTC")
-            ts = int(ko.timestamp()) - lead_min * 60
-            p = pm.price_at(mk["yes_token"], ts)
-            if p is None or not 0 < p < 1:
+            ko = int((ko.tz_convert("UTC") if ko.tzinfo else ko.tz_localize("UTC")).timestamp())
+            t_open, t_close = ko - decision_h * 3600, ko - close_lead_min * 60
+            p_open, p_close = pm.price_at(mk["yes_token"], t_open), pm.price_at(mk["yes_token"], t_close)
+            if p_open is None and p_close is None:
                 continue
-            vol = pm.volume_before(pm.trades(mk["condition_id"]), ts) if mk["condition_id"] else 0.0
+            tc = pm.trades(mk["condition_id"], until_ts=t_open - W) if mk["condition_id"] else None
+            vol = lambda t: (pm.volume_window(tc, t, W) if tc else None)
             o = outcome_of(mk["question"], r.HomeTeam, r.AwayTeam)
-            rows.append({"ts": ts, "match_id": f"{r.league}_{r.date}_{r.HomeTeam}_{r.AwayTeam}",
-                         "league": r.league, "outcome": o, "question": mk["question"], "p_pm": p,
-                         "y": int(r.FTR == o), "vol_before": vol, **{c: r[c] for c in ODDS}})
+            rows.append({"ts_open": t_open, "ts_close": t_close,
+                         "match_id": f"{r.league}_{r.date}_{r.HomeTeam}_{r.AwayTeam}", "league": r.league,
+                         "source": r.source, "outcome": o, "question": mk["question"], "y": int(r.FTR == o),
+                         "p_pm_open": p_open, "p_pm_close": p_close, "vol_open": vol(t_open),
+                         "vol_close": vol(t_close), **{c: r[c] for c in ODDS}})
         log(f"[{k}] {r.HomeTeam}-{r.AwayTeam}: ok")
     return pd.DataFrame(rows)
 
@@ -64,7 +73,7 @@ def _odds(p, margin):
 
 def synthetic(n_matches=1500, pm_noise=0.35, open_noise=0.20, close_noise=0.10, margin=0.03,
               per_day=6, seed=1):
-    """Simulación: cierre de la casa > apertura > PM en precisión."""
+    """Simulación: cierre de la casa > apertura > PM en precisión. Fuente 'SIM'."""
     rng = np.random.default_rng(seed)
     lg = lambda x: np.log(x / (1 - x))
     sg = lambda x: 1 / (1 + np.exp(-x))
@@ -76,8 +85,10 @@ def synthetic(n_matches=1500, pm_noise=0.35, open_noise=0.20, close_noise=0.10, 
         oc, oo = _odds(noisy(close_noise), margin), _odds(noisy(open_noise), margin)
         vol = float(rng.lognormal(7.5, 1.5))
         for j, o in enumerate("HDA"):
-            rows.append({"ts": int(i * 86400 / per_day), "match_id": i, "outcome": o,
-                         "p_pm": float(sg(lg(true[j]) + rng.normal(0, pm_noise))), "y": int(res == j),
-                         "vol_before": vol, "oH": oc[0], "oD": oc[1], "oA": oc[2],
-                         "ooH": oo[0], "ooD": oo[1], "ooA": oo[2]})
+            ts = int(i * 86400 / per_day)
+            p_close = float(sg(lg(true[j]) + rng.normal(0, pm_noise)))
+            rows.append({"ts_open": ts - 86400, "ts_close": ts, "match_id": i, "source": "SIM", "outcome": o,
+                         "p_pm_open": float(sg(lg(p_close) + rng.normal(0, 0.1))), "p_pm_close": p_close,
+                         "y": int(res == j), "vol_open": vol * 0.6, "vol_close": vol,
+                         "oH": oc[0], "oD": oc[1], "oA": oc[2], "ooH": oo[0], "ooD": oo[1], "ooA": oo[2]})
     return pd.DataFrame(rows)

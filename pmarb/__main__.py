@@ -10,12 +10,12 @@ def main():
     ap = argparse.ArgumentParser("pmarb")
     sp = ap.add_subparsers(dest="cmd", required=True)
     b = sp.add_parser("build", help="dataset football-data x Polymarket (aborta si la cobertura es baja)")
-    b.add_argument("--fd", nargs="*", help="CSV locales; si no, descarga --seasons x --leagues")
-    b.add_argument("--seasons", nargs="+", default=["2526", "2627"])
+    b.add_argument("--track", choices=["A", "B"], required=True,
+                   help="A: 25/26 con Pinnacle hasta el 08/01/2026 (veredicto). B: 26/27 con Betfair Exchange (referencia)")
+    b.add_argument("--fd", nargs="*", help="CSV locales de la temporada de la pista; si no, se descargan")
     b.add_argument("--leagues", nargs="+", default=["E0", "SP1", "I1", "D1", "F1"])
-    b.add_argument("--book", default="PS", help="PS (Pinnacle), Avg, Max, B365")
     b.add_argument("--tag", default="soccer")
-    b.add_argument("--lead-min", type=int, default=10)
+    b.add_argument("--vol-window-h", type=int, default=168, help="ventana de volumen previo a cada decisión")
     b.add_argument("--min-coverage", type=float, default=0.30)
     b.add_argument("--min-matches", type=int, default=150)
     b.add_argument("--out", default="dataset.csv")
@@ -45,10 +45,14 @@ def main():
 
     if a.cmd == "build":
         from .dataset import build
-        from .odds import load_football_data, fd_urls
-        srcs = a.fd or fd_urls(a.seasons, a.leagues)
-        fd = pd.concat([load_football_data(p, a.book) for p in srcs])
-        build(fd, a.tag, a.lead_min, min_rate=a.min_coverage, min_matches=a.min_matches).to_csv(a.out, index=False)
+        from .odds import load_football_data, fd_urls, TRACKS
+        tr = TRACKS[a.track]
+        print(f"Pista {a.track}: {tr['note']}")
+        fd = load_football_data(a.fd or fd_urls(tr["seasons"], a.leagues), tr["book"], tr["until"])
+        out = a.out if a.out != "dataset.csv" else f"dataset_{a.track}.csv"
+        build(fd, a.tag, vol_window_h=a.vol_window_h, min_rate=a.min_coverage,
+              min_matches=a.min_matches).to_csv(out, index=False)
+        print(f"-> {out}")
     elif a.cmd == "synthetic":
         from .dataset import synthetic
         synthetic().to_csv(a.out, index=False)
@@ -60,8 +64,16 @@ def main():
                   spread_table=load_spread_table(a.spread_table) if a.spread_table else None)
         res, v = grid(df, cfg, spreads=tuple(a.half_spreads))
         with pd.option_context("display.width", 300, "display.max_columns", 40):
-            print("half_spr = MEDIO spread ($/acción), pagado al entrar como taker\n")
+            print("half_spr = MEDIO spread ($/acción), pagado al entrar como taker")
+            for k, h in v["horizons"].items():
+                print(f"horizonte {k}: {h}")
+            print(f"fuente: {v['source']}\n")
             print(table(res).to_string(index=False))
+        unk = [(k, s["unknown_volume"]) for k, s in res.items() if s.get("unknown_volume", {}).get("markets")]
+        if unk:
+            print("\nVolumen DESCONOCIDO (/trades agotó el offset antes del punto de decisión). Fuera de las cifras de arriba:")
+            for (l, m, n), u in unk:
+                print(f"  {l}/{m}@{n}: {u['markets']} filas, {u['signals']} señales ({u['signals_per_week']:.2f}/sem), ROI {100 * u['roi']:.1f}%")
         g = v.pop("guardrail")
         print(json.dumps(v, indent=1, ensure_ascii=False))
         print("\nGuardarraíl Brier(modelo) - Brier(casa), IC95 bootstrap por partido (>0 = modelo peor):")

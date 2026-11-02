@@ -74,28 +74,40 @@ def _throttle():
     _last[0] = _time.monotonic()
 
 
-def trades(condition_id: str, page=500, max_offset=10000):
-    """Todos los trades de un mercado (una vez por mercado, cacheado en disco)."""
+def trades(condition_id: str, until_ts: int, page=500, max_offset=10000):
+    """Trades de un mercado. /trades devuelve lo MÁS RECIENTE primero, así que se pagina con offset
+    hasta encontrar un trade con t < until_ts (ya se tiene todo lo posterior) o hasta agotar el
+    histórico. Si se agota el offset antes, 'capped' = True -> volumen desconocido.
+    Cacheado por mercado; solo se vuelve a pedir si la caché no llega tan atrás y no está capada."""
     path = os.path.join(CACHE_DIR, "trades", hashlib.sha1(condition_id.encode()).hexdigest() + ".json")
-    if os.path.exists(path):
-        return json.load(open(path))
-    out = []
+    c = json.load(open(path)) if os.path.exists(path) else None
+    if c and (c["exhausted"] or c["capped"] or c["oldest"] < until_ts):
+        return c
+    out, exhausted, capped = [], False, False
     for off in range(0, max_offset, page):
         _throttle()
         batch = get_json(f"{DATA}/trades", {"market": condition_id, "limit": page, "offset": off})
-        if not batch:
-            break
         out += [{"t": int(x["timestamp"]), "usd": float(x["size"]) * float(x["price"])} for x in batch]
         if len(batch) < page:
+            exhausted = True
             break
+        if min(x["t"] for x in out) < until_ts:
+            break
+    else:
+        capped = True
+    c = {"trades": out, "oldest": min((x["t"] for x in out), default=2 ** 62),
+         "exhausted": exhausted, "capped": capped and not exhausted}
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    json.dump(out, open(path, "w"))
-    return out
+    json.dump(c, open(path, "w"))
+    return c
 
 
-def volume_before(trade_list, ts: int) -> float:
-    """USDC negociados con timestamp < ts (estricto: nada posterior a la señal)."""
-    return float(sum(x["usd"] for x in trade_list if x["t"] < ts))
+def volume_window(c: dict, ts: int, window_s: int):
+    """USDC negociados en [ts - window, ts). None si la caché no cubre ese tramo (desconocido)."""
+    lo = ts - window_s
+    if not (c["exhausted"] or c["oldest"] < lo):
+        return None
+    return float(sum(x["usd"] for x in c["trades"] if lo <= x["t"] < ts))
 
 
 def spread(token_id: str):
