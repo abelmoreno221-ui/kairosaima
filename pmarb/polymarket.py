@@ -15,17 +15,37 @@ def events(tag_slug="soccer", closed=False, limit=100, offset=0, **extra):
                                          "limit": limit, "offset": offset, **extra})
 
 
-def iter_events(tag_slug="soccer", closed=False, max_pages=500, page=100, start=None, end=None):
-    """Pagina hasta agotar. start/end (YYYY-MM-DD) acotan por fecha del partido (end_date_min/max
-    en Gamma) para no depender de un tope de páginas."""
-    # endDate = hora del saque en los partidos; startDate es la creación del mercado.
-    extra = {"end_date_min": start, "end_date_max": end} if start or end else {}
-    for i in range(max_pages):
-        batch = events(tag_slug, closed, page, i * page, **extra)
-        if not batch:
-            return
-        yield from batch
-    print(f"AVISO: iter_events alcanzó max_pages={max_pages}; puede faltar cobertura", file=__import__("sys").stderr)
+def iter_events(tag_slug="soccer", closed=False, max_pages=500, page=100, start=None, end=None, chunk_days=3):
+    """Eventos de Gamma. Sin start/end: paginación simple. Con start/end (YYYY-MM-DD, fecha del partido =
+    endDate): se piden bloques de `chunk_days` días porque Gamma corta la paginación en ~2.000
+    resultados (HTTP 422 por encima). Se deduplica por id (los bordes de los bloques se solapan)."""
+    import sys
+    import pandas as pd
+    if not (start and end):
+        for i in range(max_pages):
+            batch = events(tag_slug, closed, page, i * page)
+            if not batch:
+                return
+            yield from batch
+        return
+    seen = set()
+    d0, d1 = pd.Timestamp(start), pd.Timestamp(end)
+    while d0 <= d1:
+        hi = min(d0 + pd.Timedelta(days=chunk_days), d1 + pd.Timedelta(days=1))
+        for i in range(max_pages):
+            try:
+                batch = events(tag_slug, closed, page, i * page,
+                               end_date_min=d0.strftime("%Y-%m-%d"), end_date_max=hi.strftime("%Y-%m-%d"))
+            except Exception as e:
+                print(f"AVISO: bloque {d0.date()}..{hi.date()} cortado en offset {i * page}: {e!r}", file=sys.stderr)
+                break
+            if not batch:
+                break
+            for e in batch:
+                if e.get("id") not in seen:
+                    seen.add(e.get("id"))
+                    yield e
+        d0 = hi
 
 
 def parse_market(m: dict) -> dict:

@@ -81,6 +81,8 @@ def _pattern(dates_sorted, dropped):
     idx = np.flatnonzero(dropped)
     if len(idx) == 0:
         return "-"
+    if len(idx) == 1 and idx[0] != len(dropped) - 1:
+        return "goteo (1 fila suelta)"
     contiguous = idx[-1] - idx[0] + 1 == len(idx)
     if contiguous and idx[-1] == len(dropped) - 1:
         return f"bloque final desde {dates_sorted[idx[0]]}"
@@ -103,6 +105,8 @@ def load_football_data(srcs, book="PS", until=None, log=print) -> pd.DataFrame:
             df = pd.read_csv(io.BytesIO(get_bytes(src)), encoding="latin-1")
         else:
             df = pd.read_csv(src, encoding="latin-1")
+        df = df.copy()
+        df.columns = [str(c).replace("\ufeff", "").replace("ï»¿", "").strip() for c in df.columns]  # BOM
         miss = [c for c in (*BASE_COLS, *need) if c not in df.columns]
         if miss:
             absent.append((src, miss))
