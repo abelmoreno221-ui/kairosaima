@@ -2,3 +2,7 @@ __pycache__/
 *.csv
 weights.json
 .env
+run/
+.cache/
+.venv/
+*.log
