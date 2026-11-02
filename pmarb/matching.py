@@ -24,7 +24,10 @@ def sim(a: str, b: str) -> float:
     a, b = norm(a), norm(b)
     wa, wb = set(a.split()), set(b.split())
     if wa and wb and (wa <= wb or wb <= wa):
-        return 0.95
+        return 0.95                                   # palabras exactas
+    short, long_ = (wa, wb) if len(wa) <= len(wb) else (wb, wa)
+    if short and all(len(w) >= 4 and any(x.startswith(w) or w.startswith(x) for x in long_) for w in short):
+        return 0.90                                   # prefijo: hamburg~hamburger, lyon~lyonnais
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 

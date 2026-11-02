@@ -37,6 +37,9 @@ class Core(unittest.TestCase):
         self.assertEqual(outcome_of("Will Wolves win on 2025-09-20?", "Wolves", "Leeds"), "H")
         self.assertEqual(outcome_of("Will FC Internazionale Milano win on 2025-11-23?", "Inter", "Milan"), "H")
         self.assertEqual(outcome_of("Will AC Milan win on 2025-11-23?", "Inter", "Milan"), "A")
+        self.assertEqual(outcome_of("Will Hamburger SV win on 2025-09-20?", "Hamburg", "Heidenheim"), "H")
+        self.assertEqual(outcome_of("Will Olympique Lyonnais win on 2025-09-19?", "Angers", "Lyon"), "A")
+        self.assertIsNotNone(match_event("Brest", "Nice", [{"title": "Stade Brestois 29 vs. OGC Nice"}]))
         spread = {"title": "OGC Nice vs. Olympique Lyonnais", "markets": [{"question": "Spread: OGC Nice (-0.5)"}]}
         self.assertIsNone(match_event("Nice", "Lyon", [spread]))
 
