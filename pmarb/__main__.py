@@ -14,7 +14,7 @@ def main():
                    help="A: 25/26 Pinnacle hasta 08/01/2026 (veredicto). B: 26/27 Betfair Exchange (referencia). "
                         "C: Avg/Max (inválida, diagnóstico)")
     b.add_argument("--book", choices=["Avg", "Max"], help="solo pista C (por defecto Avg)")
-    b.add_argument("--decision-h", type=int, default=24, help="punto de decisión con la apertura (24; 6 si T-24h no es viable)")
+    b.add_argument("--seasons", nargs="+", help="sobrescribe las temporadas de la pista (p. ej. 2526 2627)")
     b.add_argument("--fd", nargs="*", help="CSV locales de la temporada de la pista; si no, se descargan")
     b.add_argument("--leagues", nargs="+", default=["E0", "SP1", "I1", "D1", "F1"])
     b.add_argument("--tag", default="soccer")
@@ -33,6 +33,8 @@ def main():
     t.add_argument("--spread-table", help="spread_table.json de `spreads summary` (añade nivel 'cal')")
     t.add_argument("--min-matches", type=int, default=150)
     t.add_argument("--coverage", help="cobertura por liga de `build` (por defecto <data>.coverage.csv)")
+    t.add_argument("--decision-h", choices=["24", "6", "close"], default="24",
+                   help="24: validación conservadora; 6: operativo; close: T-10min, techo de investigación")
     t.add_argument("--json-out", default="backtest.json")
     f = sp.add_parser("fit")
     f.add_argument("data")
@@ -55,10 +57,13 @@ def main():
         if a.book and a.track != "C":
             raise SystemExit("--book solo vale para la pista C: las pistas A y B no cambian de casa.")
         book = a.book or tr["book"]
-        fd = load_football_data(a.fd or fd_urls(tr["seasons"], a.leagues), book, tr["until"])
-        out = a.out if a.out != "dataset.csv" else f"dataset_{a.track}{'' if a.decision_h == 24 else f'_T{a.decision_h}'}.csv"
-        ds, cov = build(fd, a.tag, decision_h=a.decision_h, vol_window_h=a.vol_window_h,
-                        min_rate=a.min_coverage, min_matches=a.min_matches)
+        fd = load_football_data(a.fd or fd_urls(a.seasons or tr["seasons"], a.leagues), book, tr["until"])
+        out = a.out if a.out != "dataset.csv" else f"dataset_{a.track}.csv"
+        drops = fd.attrs["drops"]
+        if fd.attrs["absent"]:
+            drops = pd.concat([drops, pd.DataFrame([{**x, "pattern": "columna ausente"} for x in fd.attrs["absent"]])])
+        drops.to_csv(out.replace(".csv", ".drops.csv"), index=False)
+        ds, cov = build(fd, a.tag, vol_window_h=a.vol_window_h, min_rate=a.min_coverage, min_matches=a.min_matches)
         ds.to_csv(out, index=False)
         cov.to_csv(out.replace(".csv", ".coverage.csv"), index=False)
         print(f"-> {out}")
@@ -74,7 +79,7 @@ def main():
         import os
         cov_path = a.coverage or a.data.replace(".csv", ".coverage.csv")
         cov = pd.read_csv(cov_path) if os.path.exists(cov_path) else None
-        res, v = grid(df, cfg, spreads=tuple(a.half_spreads), coverage=cov)
+        res, v = grid(df, cfg, spreads=tuple(a.half_spreads), coverage=cov, decision=a.decision_h)
         with pd.option_context("display.width", 300, "display.max_columns", 40):
             print("half_spr = MEDIO spread ($/acción), pagado al entrar como taker")
             for k, h in v["horizons"].items():
@@ -86,12 +91,25 @@ def main():
             print("\nVolumen DESCONOCIDO (/trades agotó el offset antes del punto de decisión). Fuera de las cifras de arriba:")
             for (l, m, n), u in unk:
                 print(f"  {l}/{m}@{n}: {u['markets']} filas, {u['signals']} señales ({u['signals_per_week']:.2f}/sem), ROI {100 * u['roi']:.1f}%")
+        dp = a.data.replace(".csv", ".drops.csv")
+        if os.path.exists(dp):
+            dr = pd.read_csv(dp).fillna("")
+            print("\nFILAS DESCARTADAS POR FICHERO (bloque = corte de la fuente; goteo = huecos sueltos):")
+            for _, r in dr.iterrows():
+                if r.get("pattern") == "columna ausente":
+                    print(f"  {r.file}: COLUMNA AUSENTE {r.missing} -> fichero omitido, temporada truncada")
+                    continue
+                n = int(r.dropped_no_open) + int(r.dropped_no_close)
+                print(f"  {r.file}: {n} descartadas ({int(r.dropped_no_open)} sin apertura, "
+                      f"{int(r.dropped_no_close)} sin cierre) -> {r.pattern}")
+                if n:
+                    print(f"     fechas: {r.dates}")
         fn = pd.DataFrame(v["funnel"])
-        print(f"\nEMBUDO POR LIGA (apertura, {v['funnel_level']}; señal neta solo en periodo fuera de muestra):")
+        print(f"\nEMBUDO POR LIGA ({v['funnel_level']}; señal neta solo en periodo fuera de muestra):")
         print(fn.to_string(index=False))
         if v["funnel_not_viable"]:
             print(f"  <-- MARCA: {', '.join(map(str, v['funnel_not_viable']))} con < 20 partidos tras el filtro de volumen. "
-                  "T-24h no es viable ahí: reconstruir con `build --decision-h 6`.")
+                  f"El horizonte {a.decision_h} no es viable ahí" + (": probar `--decision-h 6`." if a.decision_h == "24" else "."))
         for r in v["recommendation"]:
             print(f"\nRECOMENDACIÓN: {r}")
         g = v.pop("guardrail")
@@ -111,7 +129,7 @@ def main():
         json.dump({"/".join(k): s for k, s in res.items()} | {"verdict": v},
                   open(a.json_out, "w"), indent=2, default=str)
     elif a.cmd == "fit":
-        df = with_book(pd.read_csv(a.data), "open", "shin")
+        df = with_book(pd.read_csv(a.data), "open", "shin", "6")
         m = Blend().fit(df.p_pm.values, df.p_book.values, df.y.values)
         json.dump({"w": m.w.tolist(), "n": len(df)}, open(a.out, "w"))
         print("w =", m.w.round(3), "(intercepto, peso PM, peso casa)")

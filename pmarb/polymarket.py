@@ -49,6 +49,16 @@ def price_at(token_id: str, ts: int, window_s=6 * 3600):
     return hist[-1][1] if hist else None
 
 
+def prices_at(token_id: str, ts_list, window_s=6 * 3600):
+    """Último precio <= cada ts, con UNA sola llamada a prices-history. None si no hay."""
+    hist = price_history(token_id, min(ts_list) - window_s, max(ts_list))
+    out = []
+    for ts in ts_list:
+        h = [p for t, p in hist if ts - window_s <= t <= ts]
+        out.append(h[-1] if h else None)
+    return out
+
+
 def top_of_book(token_id: str):
     b = get_json(f"{CLOB}/book", {"token_id": token_id})
     bids = sorted((float(x["price"]), float(x["size"])) for x in b.get("bids", []))

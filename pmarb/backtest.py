@@ -2,11 +2,12 @@
 x medio spread {1, 2, 3, 5 céntimos [, calibrado]}.
 
 Dataset: match_id, source, outcome (H/D/A), y, cuotas oH/oD/oA (cierre) y ooH/ooD/ooA (apertura),
-y por punto de decisión: ts_open/p_pm_open/vol_open (T-24h) y ts_close/p_pm_close/vol_close (T-10min).
+y por punto de decisión ts_{p}/p_pm_{p}/vol_{p} con p en {24, 6, close}.
 
-Horizontes:
-- open:  apertura de football-data (viernes/martes tarde = T-24h a T-72h); decisión en PM a T-24h.
-- close: cierre al saque; decisión a T-10min. No existe al decidir -> solo investigación.
+Horizontes (--decision-h):
+- 6:     apertura de football-data + PM a T-6h. Horizonte OPERATIVO (el del escáner).
+- 24:    apertura (recogida viernes/martes tarde = T-24h..T-72h) + PM a T-24h. Validación CONSERVADORA.
+- close: cierre + PM a T-10min. TECHO de investigación: el cierre no existe al decidir.
 Una fuente por backtest: si el dataset mezcla casas (p. ej. PS y BFE), se aborta.
 
 Convenciones de costes (verificadas en tests):
@@ -23,8 +24,10 @@ from .devig import METHODS
 from .model import Blend, brier, report
 
 LINES = {"close": ("oH", "oD", "oA"), "open": ("ooH", "ooD", "ooA")}
-HOURS = {"open": 24.0, "close": 10 / 60}
-HORIZON = {"open": "apertura T-24h..T-72h, decisión PM a T-24h", "close": "cierre al saque, decisión a T-10min"}
+POINT_HOURS = {"24": 24.0, "6": 6.0, "close": 10 / 60}
+HORIZON = {"24": "apertura (T-24h..T-72h) + PM a T-24h: validación conservadora",
+           "6": "apertura + PM a T-6h: horizonte operativo",
+           "close": "cierre + PM a T-10min: techo de investigación"}
 VALID_BOOK = "PS"
 INVALID_BOOKS = ("Avg", "Max")
 MIN_BETS = 150          # suelo de muestra: por debajo, ningún veredicto pasa de "no evaluable"
@@ -87,13 +90,15 @@ def check_single_source(df):
     return next(iter(src), None)
 
 
-def with_book(df: pd.DataFrame, line="close", method="shin") -> pd.DataFrame:
-    """Fija el punto de decisión de la línea (ts, p_pm, vol_before, hours) y añade p_book."""
+def with_book(df: pd.DataFrame, line="close", method="shin", decision="24") -> pd.DataFrame:
+    """Fija el punto de decisión (ts, p_pm, vol_before, hours) y añade p_book.
+    La línea de cierre siempre decide a T-10min; la de apertura en `decision` (24 o 6)."""
     cols = LINES[line]
+    pt = "close" if line == "close" else str(decision)
     df = df.copy()
-    if f"p_pm_{line}" in df:
-        df["ts"], df["p_pm"], df["vol_before"] = df[f"ts_{line}"], df[f"p_pm_{line}"], df[f"vol_{line}"]
-    df["hours"] = df["decision_h"] if (line == "open" and "decision_h" in df) else HOURS[line]
+    if f"p_pm_{pt}" in df:
+        df["ts"], df["p_pm"], df["vol_before"] = df[f"ts_{pt}"], df[f"p_pm_{pt}"], df[f"vol_{pt}"]
+    df["hours"] = POINT_HOURS[pt]
     df = df.dropna(subset=[*cols, "p_pm"])
     f, idx = METHODS[method], {"H": 0, "D": 1, "A": 2}
     df["p_book"] = [f([r[cols[0]], r[cols[1]], r[cols[2]]])[idx[r.outcome]] for _, r in df.iterrows()]
@@ -113,16 +118,25 @@ def predict_oos(df: pd.DataFrame, cfg: Cfg):
     return preds, blocks
 
 
+def eligible(df: pd.DataFrame, preds, cfg: Cfg, unknown_volume=False):
+    """Máscara ÚNICA de filas operables, compartida por el modelo y por regla_pin:
+    mercado vivo en el punto de decisión (p_pm no nulo; with_book ya quita el resto), periodo
+    fuera de muestra (pred no nula) y filtro de volumen (o volumen desconocido si se pide)."""
+    vol = df["vol_before"].values.astype(float) if "vol_before" in df else np.full(len(df), np.inf)
+    live = df["p_pm"].notna().values
+    oos = ~np.isnan(np.asarray(preds, float))
+    vol_ok = np.isnan(vol) if unknown_volume else (~np.isnan(vol) & (vol >= cfg.min_volume))
+    return live & oos & vol_ok
+
+
 def simulate(df: pd.DataFrame, preds, cfg: Cfg, unknown_volume=False) -> pd.DataFrame:
     """unknown_volume=False: solo filas con volumen conocido >= min_volume.
     unknown_volume=True: solo filas con volumen desconocido (se reportan aparte, banca propia)."""
     bank, rows = cfg.bankroll, []
-    vol = df["vol_before"].values.astype(float) if "vol_before" in df else np.full(len(df), np.inf)
+    ok = eligible(df, preds, cfg, unknown_volume)
     hours = df["hours"].values if "hours" in df else np.full(len(df), np.nan)
     for i, r in enumerate(df.itertuples()):
-        if np.isnan(preds[i]):
-            continue
-        if unknown_volume != bool(np.isnan(vol[i])) or (not unknown_volume and vol[i] < cfg.min_volume):
+        if not ok[i]:
             continue
         h = None if np.isnan(hours[i]) else hours[i]
         d = decide(preds[i], r.p_pm, cfg, h)
@@ -222,7 +236,8 @@ def _solo_fails(s):
 
 
 def _rule_pin(d, preds, cfg):
-    """Regla sin modelo: Pinnacle directa como probabilidad, mismo umbral, mismo periodo OOS."""
+    """Regla sin modelo: Pinnacle directa como probabilidad. Mismas filas que el modelo (misma
+    máscara `eligible`: mercado vivo, cobertura, periodo OOS y volumen), mismo umbral y costes."""
     p = np.where(np.isnan(preds), np.nan, d.p_book.values)
     t = simulate(d, p, cfg)
     m = ~np.isnan(p)
@@ -231,19 +246,19 @@ def _rule_pin(d, preds, cfg):
             "signals_per_week": weekly(t, d.ts[m].min(), d.ts[m].max())["mean"]}
 
 
-def funnel(df, cfg, trades_open, coverage=None):
-    """Embudo por liga (línea de apertura): emparejados -> mercado vivo a T-24h -> volumen -> señal neta."""
+def funnel(df, cfg, trades_open, coverage=None, decision="24"):
+    """Embudo por liga en el horizonte elegido: emparejados -> mercado vivo -> volumen -> señal neta."""
     df = df.copy()
     if "league" not in df:
         df["league"] = "?"
-    pcol = "p_pm_open" if "p_pm_open" in df else "p_pm"
-    vcol = "vol_open" if "vol_open" in df else "vol_before"
+    pcol = f"p_pm_{decision}" if f"p_pm_{decision}" in df else "p_pm"
+    vcol = f"vol_{decision}" if f"vol_{decision}" in df else "vol_before"
     g = df.groupby("league")
     out = pd.DataFrame({"emparejados": g.match_id.nunique()})
     if coverage is not None:
         out["emparejados"] = coverage.set_index("league").matched.reindex(out.index).fillna(out.emparejados)
     live = df[df[pcol].notna()]
-    out["vivo_T-24h"] = live.groupby("league").match_id.nunique()
+    out["mercado_vivo"] = live.groupby("league").match_id.nunique()
     vol = live[vcol] if vcol in live else pd.Series(np.inf, index=live.index)
     out["supera_volumen"] = live[vol >= cfg.min_volume].groupby("league").match_id.nunique()
     known = live[vol.notna()].match_id.unique()
@@ -251,25 +266,35 @@ def funnel(df, cfg, trades_open, coverage=None):
     sig = df[df.match_id.isin(set(trades_open.match_id) if len(trades_open) else set())]
     out["con_señal_neta"] = sig.groupby("league").match_id.nunique()
     out = out.fillna(0).astype(int)
-    out["T-24h_viable"] = out.supera_volumen >= FUNNEL_MIN
+    out["horizonte_viable"] = out.supera_volumen >= FUNNEL_MIN
     return out
 
 
-def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), spreads=SPREADS, coverage=None):
-    """res[(line, método, nivel_spread)] -> resumen. Nivel 'cal' = tabla calibrada si se pasa."""
+def _rule_alive(s):
+    r = s["regla_pin"]
+    return bool(r["roi_ci95"] and r["roi_ci95"][0] > 0 and r["n"] >= MIN_BETS
+                and s["oos_logloss"]["book"] < s["oos_logloss"]["pm"])
+
+
+def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), spreads=SPREADS,
+         coverage=None, decision="24"):
+    """res[(line, método, nivel_spread)] -> resumen. decision: 24 | 6 | close (horizonte del veredicto).
+    Con 'close' solo se evalúa la línea de cierre y el veredicto es, como mucho, techo de investigación."""
+    decision = str(decision)
     source = check_single_source(df)
     levels = [(f"{h:.2f}", replace(cfg, half_spread=h, spread_table=None)) for h in spreads]
     if cfg.spread_table:
         levels.append(("cal", cfg))
     base_level = "cal" if cfg.spread_table else levels[0][0]
-    dh = int(df["decision_h"].iloc[0]) if "decision_h" in df else int(HOURS["open"])
-    horizons = {**HORIZON, "open": f"apertura T-24h..T-72h, decisión PM a T-{dh}h"}
+    prim = "close" if decision == "close" else "open"
+    lines = ("close",) if decision == "close" else tuple(LINES)
+    horizons = {"open": HORIZON.get(decision, ""), "close": HORIZON["close"]}
     res, guard, funnel_trades = {}, {}, pd.DataFrame()
-    for line in LINES:
+    for line in lines:
         if df[list(LINES[line])].isna().all().all():
             continue
         for meth in methods:
-            d = with_book(df, line, meth)
+            d = with_book(df, line, meth, decision if line == "open" else "close")
             preds, blocks = predict_oos(d, cfg)
             guard[(line, meth)] = guardrail(d, preds)
             for name, c in levels:
@@ -278,9 +303,9 @@ def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), sp
                 s["horizon"] = horizons[line]
                 s["regla_pin"] = _rule_pin(d, preds, c)
                 res[(line, meth, name)] = s
-                if (line, meth, name) == ("open", methods[0], base_level):
+                if (line, meth, name) == (prim, methods[0], base_level):
                     funnel_trades = t
-    v = {"edge_dies_at_half_spread": {}, "method_sensitive": {}, "guardrail": {}}
+    v = {"decision_h": decision, "edge_dies_at_half_spread": {}, "method_sensitive": {}, "guardrail": {}}
     for (line, meth), g in guard.items():
         lv = [n for n, _ in levels if (line, meth, n) in res]
         dead = next((n for n in lv if n != "cal" and not _alive(res[(line, meth, n)])), None)
@@ -294,55 +319,53 @@ def grid(df: pd.DataFrame, cfg: Cfg = Cfg(), methods=("shin", "prop", "log"), sp
     v["guardrail_warning"] = [k for k, g in v["guardrail"].items() if g["model_worse_than_book"]]
 
     base = ("0.01", "cal")
-    opn = [s for (l, _, n), s in res.items() if l == "open" and n in base]
-    cls = [s for (l, _, n), s in res.items() if l == "close" and n in base]
+    P = [s for (l, _, n), s in res.items() if l == prim and n in base]
+    C = [s for (l, _, n), s in res.items() if l == "close" and n in base] if prim == "open" else []
     big = lambda s: s["signals"] >= MIN_BETS
     v["min_bets"] = MIN_BETS
-    v["bets_open_max"] = max((s["signals"] for s in opn), default=0)
-    v["solo_modelo_fails_open"] = any(_solo_fails(s) for s in opn)
-    v["solo_modelo_small_open"] = any(s["groups"]["solo_modelo"]["n"] < MIN_SOLO_N for s in opn)
-    open_alive = [s for s in opn if _alive(s) and big(s)]
-    if open_alive and v["solo_modelo_fails_open"]:
-        verdict = "no candidata (solo_modelo pierde en apertura: el blend fabrica señales)"
-    elif open_alive and v["solo_modelo_small_open"]:
-        verdict = f"no evaluable (solo_modelo con n<{MIN_SOLO_N} en apertura)"
-    elif open_alive:
-        verdict = "candidata (edge en apertura)"
-    elif any(_alive(s) for s in opn) or not any(big(s) for s in opn):
-        verdict = f"no evaluable (menos de {MIN_BETS} apuestas en apertura)"
-    elif any(_alive(s) and big(s) for s in cls):
+    v["bets_max"] = max((s["signals"] for s in P), default=0)
+    v["solo_modelo_fails"] = any(_solo_fails(s) for s in P)
+    v["solo_modelo_small"] = any(s["groups"]["solo_modelo"]["n"] < MIN_SOLO_N for s in P)
+    model_alive = [s for s in P if _alive(s) and big(s)]
+    # regla_pin gana si está viva (IC>0, >=150 apuestas, Pinnacle mejor que PM) y el modelo no puede
+    # ser candidato (no vivo, solo_modelo pierde o no es evaluable) o rinde menos, con las mismas filas.
+    model_ok = lambda s: _alive(s) and big(s) and not _solo_fails(s) and s["groups"]["solo_modelo"]["n"] >= MIN_SOLO_N
+    rule_wins = [s for s in P if _rule_alive(s) and (not model_ok(s) or s["regla_pin"]["roi"] >= s["roi"])]
+    v["rule_beats_model"] = bool(rule_wins)
+    if rule_wins:
+        verdict = "candidata: REGLA SIN MODELO (Pinnacle directa frente al ask; la regresión sobra)"
+    elif model_alive and v["solo_modelo_fails"]:
+        verdict = "no candidata (solo_modelo pierde: el blend fabrica señales)"
+    elif model_alive and v["solo_modelo_small"]:
+        verdict = f"no evaluable (solo_modelo con n<{MIN_SOLO_N})"
+    elif model_alive:
+        verdict = "candidata: modelo (blend)"
+    elif any(_alive(s) or _rule_alive(s) for s in P) or not any(big(s) for s in P):
+        verdict = f"no evaluable (menos de {MIN_BETS} apuestas)"
+    elif any((_alive(s) and big(s)) or _rule_alive(s) for s in C):
         verdict = "solo investigación (edge solo en cierre)"
-    elif any(_alive(s) for s in cls):
+    elif any(_alive(s) for s in C):
         verdict = f"no evaluable (edge solo en cierre con menos de {MIN_BETS} apuestas)"
     else:
         verdict = "sin edge"
+    if decision == "close" and verdict.startswith("candidata"):
+        verdict = "techo de investigación (no operable): " + verdict.split(": ", 1)[1]
+    verdict += f" [horizonte: {HORIZON[decision]}]"
 
-    rec = []
-    if v["solo_modelo_small_open"]:
-        ok = [s for s in opn if s["groups"]["con_pinnacle"]["roi_ci95"] and s["groups"]["con_pinnacle"]["roi_ci95"][0] > 0]
-        if ok:
-            r = ok[0]["regla_pin"]
-            rec.append(
-                "solo_modelo no es evaluable y con_pinnacle funciona: quitar la regresión y usar Pinnacle "
-                "directa como regla de umbral (p_book frente al ask, mismo min_edge). "
-                f"ROI de esa regla sin modelo en este backtest: {100 * r['roi']:.1f}% con {r['n']} apuestas "
-                f"(IC95 {[round(100 * x, 1) for x in r['roi_ci95']] if r['roi_ci95'] else 'n<30'}).")
-        rec.append("El ROI de con_pinnacle NO es el ROI de la regla sin modelo: esas señales las elige y "
-                   "dimensiona el modelo (Kelly sobre p_modelo) y dependen de su umbral; la regla pura es la "
-                   "columna 'regla_pin'.")
-    v["recommendation"] = rec
-
+    v["recommendation"] = ["El ROI de con_pinnacle NO es el ROI de la regla sin modelo: esas señales las elige y "
+                           "dimensiona el modelo (Kelly sobre p_modelo); la regla pura es la columna 'regla_pin', "
+                           "calculada sobre las mismas filas filtradas."]
     v["source"] = source
-    if source == "Max" or source in INVALID_BOOKS:
+    if source in INVALID_BOOKS:
         verdict += f" | NO VÁLIDO: pista C ({source})" + (", Max infla el edge" if source == "Max" else "")
     elif source and source != VALID_BOOK:
         verdict += f" | referencia ({source}), no veredicto: solo la pista A con Pinnacle es válida"
     v["verdict"] = verdict
-    v["horizons"] = horizons
-    fn = funnel(df, cfg, funnel_trades, coverage)
+    v["horizons"] = HORIZON
+    fn = funnel(df, cfg, funnel_trades, coverage, decision)
     v["funnel"] = fn.reset_index().to_dict("records")
-    v["funnel_level"] = f"open/{methods[0]}@{base_level}"
-    v["funnel_not_viable"] = [l for l, ok in fn["T-24h_viable"].items() if not ok]
+    v["funnel_level"] = f"{prim}/{methods[0]}@{base_level}, PM a {decision if decision == 'close' else 'T-' + decision + 'h'}"
+    v["funnel_not_viable"] = [l for l, ok in fn["horizonte_viable"].items() if not ok]
     return res, v
 
 

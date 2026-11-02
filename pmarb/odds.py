@@ -3,6 +3,7 @@
 - En vivo: The Odds API (plan gratis ~500 req/mes), bookmaker 'pinnacle' en region 'eu'.
 """
 import os
+import numpy as np
 import pandas as pd
 from .http import get_json
 
@@ -38,32 +39,69 @@ def _cols(book):
             f"{book}H": "ooH", f"{book}D": "ooD", f"{book}A": "ooA"}
 
 
+BASE_COLS = ("Date", "HomeTeam", "AwayTeam", "FTR")
+
+
+def _pattern(dates_sorted, dropped):
+    """'bloque' si las filas descartadas son contiguas en el calendario del fichero, si no 'goteo'."""
+    idx = np.flatnonzero(dropped)
+    if len(idx) == 0:
+        return "-"
+    contiguous = idx[-1] - idx[0] + 1 == len(idx)
+    if contiguous and idx[-1] == len(dropped) - 1:
+        return f"bloque final desde {dates_sorted[idx[0]]}"
+    return f"bloque {dates_sorted[idx[0]]}..{dates_sorted[idx[-1]]}" if contiguous else "goteo"
+
+
 def load_football_data(srcs, book="PS", until=None, log=print) -> pd.DataFrame:
-    """Carga UNA casa. Filas sin las 6 cuotas de esa casa (apertura + cierre) se descartan y se cuentan."""
-    out = []
+    """Carga UNA casa y distingue dos casos:
+    - COLUMNA AUSENTE en un fichero (p. ej. PSH en 26/27): aviso con el nombre del fichero, la
+      temporada se trunca en la fecha del último partido con datos y se continúa. Solo se aborta si
+      la columna falta en TODOS los ficheros, con mensaje de columna ausente.
+    - VALOR VACÍO: se descarta la fila y se cuenta; se registran sus fechas por fichero.
+    El registro de descartes queda en df.attrs['drops'] (una fila por fichero)."""
+    need = list(_cols(book))
+    out, drops, absent = [], [], []
     for src in ([srcs] if isinstance(srcs, str) else srcs):
         df = pd.read_csv(src, encoding="latin-1")
-        ren = _cols(book)
-        df = df.rename(columns=ren)
-        for c in ren.values():
-            if c not in df:
-                df[c] = float("nan")
+        miss = [c for c in (*BASE_COLS, *need) if c not in df.columns]
+        if miss:
+            absent.append((src, miss))
+            log(f"AVISO {src}: columna ausente {miss}. Fichero omitido; la temporada se trunca "
+                f"en el último partido con datos.")
+            continue
+        df = df.rename(columns=_cols(book))
         df["date"] = pd.to_datetime(df["Date"], dayfirst=True).dt.date
         df["league"] = df["Div"] if "Div" in df else "?"
-        df = df.dropna(subset=["FTR"])
+        df = df.dropna(subset=["FTR"]).sort_values("date").reset_index(drop=True)
+        n_cut = 0
         if until:
-            df = df[df.date < pd.Timestamp(until).date()]
-        n0 = len(df)
-        no_open = df[["ooH", "ooD", "ooA"]].isna().any(axis=1)
-        no_close = df[["oH", "oD", "oA"]].isna().any(axis=1) & ~no_open
-        df = df[~(no_open | no_close)]
-        log(f"{src}: {n0} partidos, descartados {int(no_open.sum())} sin apertura {book} "
-            f"y {int(no_close.sum())} sin cierre {book} -> {len(df)}")
-        out.append(df[["date", "league", "HomeTeam", "AwayTeam", "FTR", *ren.values()]])
+            keep = df.date < pd.Timestamp(until).date()
+            n_cut, df = int((~keep).sum()), df[keep].reset_index(drop=True)
+        no_open = df[["ooH", "ooD", "ooA"]].isna().any(axis=1).values
+        no_close = df[["oH", "oD", "oA"]].isna().any(axis=1).values & ~no_open
+        dropped = no_open | no_close
+        dates = df.date.astype(str).tolist()
+        drops.append({"file": src, "rows": len(df), "cut_by_date": n_cut,
+                      "dropped_no_open": int(no_open.sum()), "dropped_no_close": int(no_close.sum()),
+                      "pattern": _pattern(dates, dropped),
+                      "dates": ",".join(sorted(set(np.array(dates)[dropped])))})
+        log(f"{src}: {len(df)} partidos, descartados {int(no_open.sum())} sin apertura {book} y "
+            f"{int(no_close.sum())} sin cierre {book} ({drops[-1]['pattern']})"
+            + (f"; {n_cut} posteriores a {until} fuera por corte" if n_cut else ""))
+        out.append(df.loc[~dropped, ["date", "league", "HomeTeam", "AwayTeam", "FTR", *_cols(book).values()]])
+    if not out:
+        cols = sorted({c for _, m in absent for c in m})
+        raise SystemExit(f"ABORTADO: columna ausente en todos los ficheros: {cols} ({BOOKS.get(book, book)}). "
+                         "No se cambia de casa.")
     df = pd.concat(out)
     if df.empty:
-        raise SystemExit(f"ABORTADO: ningún partido con cuotas {BOOKS.get(book, book)} ({book}*). No se cambia de casa.")
+        raise SystemExit(f"ABORTADO: las columnas {book}* existen pero todas las filas están vacías.")
+    if absent:
+        log(f"Temporada truncada en {df.date.max()} (último partido con datos {book}).")
     df["source"] = book
+    df.attrs["drops"] = pd.DataFrame(drops)
+    df.attrs["absent"] = [{"file": f, "missing": ",".join(m)} for f, m in absent]
     return df
 
 

@@ -1,5 +1,5 @@
 """Escáner en vivo (PAPER TRADING): casa (The Odds API) vs order book de Polymarket.
-Punto de decisión fijo en T-24h (mismo horizonte que la línea de apertura del backtest):
+Punto de decisión por defecto en T-6h (horizonte operativo; el backtest lo evalúa con --decision-h 6):
 solo evalúa partidos cuyo saque está a decision_h ± tol_h horas. Lánzalo cada hora.
 No envía órdenes. Registra señales en CSV para validarlas a posteriori (forward test)."""
 import json
@@ -14,7 +14,7 @@ from .model import Blend
 
 
 def scan(sport="soccer_epl", tag_slug="soccer", weights_path="weights.json", out="signals.csv",
-         cfg: Cfg = Cfg(), devig="shin", decision_h=24.0, tol_h=1.0):
+         cfg: Cfg = Cfg(), devig="shin", decision_h=6.0, tol_h=1.0):
     model = Blend()
     model.w = json.load(open(weights_path))["w"] if os.path.exists(weights_path) else [0.0, 0.0, 1.0]
     from .odds import odds_api_live

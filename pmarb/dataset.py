@@ -1,8 +1,9 @@
 """Dataset histórico: football-data (apertura + cierre de UNA casa) x Polymarket.
 Fase 1 (barata): emparejar y medir cobertura -> aborta si es insuficiente.
-Fase 2, dos puntos de decisión por mercado:
-  - apertura: precio PM y volumen a T-24h (la apertura de football-data es de T-24h a T-72h).
-  - cierre:   precio PM y volumen a T-10min (solo investigación).
+Fase 2, tres puntos de decisión por mercado (precio PM y volumen en cada uno):
+  - 24:    T-24h  -> con la apertura de football-data (T-24h..T-72h): validación conservadora.
+  - 6:     T-6h   -> horizonte operativo (el del escáner).
+  - close: T-10min -> con el cierre: techo de investigación.
 Volumen = USDC negociados en los `vol_window_h` previos a cada punto (data-api, una vez por mercado).
 Si /trades se agota antes de cubrir el tramo, el volumen queda NaN (desconocido), no se descarta."""
 from datetime import datetime, time
@@ -12,7 +13,7 @@ from . import polymarket as pm
 from .matching import match_event, outcome_of
 
 ODDS = ["oH", "oD", "oA", "ooH", "ooD", "ooA"]
-DECISION_H = 24
+POINTS = {"24": 24 * 3600, "6": 6 * 3600, "close": 10 * 60}  # segundos antes del saque
 
 
 class LowCoverage(SystemExit):
@@ -40,9 +41,9 @@ def coverage(fd: pd.DataFrame, events: list, min_rate=0.30, min_matches=150, log
     return out
 
 
-def build(fd: pd.DataFrame, tag_slug="soccer", close_lead_min=10, decision_h=DECISION_H,
-          vol_window_h=168, kickoff_utc_hour=12, min_rate=0.30, min_matches=150, log=print):
-    """Devuelve (dataset, cobertura_por_liga). decision_h: punto de decisión con la apertura (24 o 6)."""
+def build(fd: pd.DataFrame, tag_slug="soccer", vol_window_h=168, kickoff_utc_hour=12,
+          min_rate=0.30, min_matches=150, log=print):
+    """Devuelve (dataset, cobertura_por_liga). Columnas ts_/p_pm_/vol_ para cada punto de POINTS."""
     matched = coverage(fd, list(pm.iter_events(tag_slug, closed=True)), min_rate, min_matches, log)
     W = vol_window_h * 3600
     rows = []
@@ -53,18 +54,19 @@ def build(fd: pd.DataFrame, tag_slug="soccer", close_lead_min=10, decision_h=DEC
                 continue
             ko = pd.Timestamp(mk["start"]) if mk["start"] else pd.Timestamp(datetime.combine(r.date, time(kickoff_utc_hour)))
             ko = int((ko.tz_convert("UTC") if ko.tzinfo else ko.tz_localize("UTC")).timestamp())
-            t_open, t_close = ko - decision_h * 3600, ko - close_lead_min * 60
-            p_open, p_close = pm.price_at(mk["yes_token"], t_open), pm.price_at(mk["yes_token"], t_close)
-            if p_open is None and p_close is None:
+            ts = {k_: ko - off for k_, off in POINTS.items()}
+            prices = dict(zip(ts, pm.prices_at(mk["yes_token"], list(ts.values()))))
+            if all(p is None for p in prices.values()):
                 continue
-            tc = pm.trades(mk["condition_id"], until_ts=t_open - W) if mk["condition_id"] else None
-            vol = lambda t: (pm.volume_window(tc, t, W) if tc else None)
+            tc = pm.trades(mk["condition_id"], until_ts=min(ts.values()) - W) if mk["condition_id"] else None
             o = outcome_of(mk["question"], r.HomeTeam, r.AwayTeam)
-            rows.append({"ts_open": t_open, "ts_close": t_close,
-                         "match_id": f"{r.league}_{r.date}_{r.HomeTeam}_{r.AwayTeam}", "league": r.league,
-                         "source": r.source, "outcome": o, "question": mk["question"], "y": int(r.FTR == o),
-                         "p_pm_open": p_open, "p_pm_close": p_close, "vol_open": vol(t_open),
-                         "vol_close": vol(t_close), "decision_h": decision_h, **{c: r[c] for c in ODDS}})
+            row = {"match_id": f"{r.league}_{r.date}_{r.HomeTeam}_{r.AwayTeam}", "league": r.league,
+                   "source": r.source, "outcome": o, "question": mk["question"], "y": int(r.FTR == o),
+                   **{c: r[c] for c in ODDS}}
+            for k_, t in ts.items():
+                row[f"ts_{k_}"], row[f"p_pm_{k_}"] = t, prices[k_]
+                row[f"vol_{k_}"] = pm.volume_window(tc, t, W) if tc else None
+            rows.append(row)
         log(f"[{k}] {r.HomeTeam}-{r.AwayTeam}: ok")
     return pd.DataFrame(rows), matched.attrs["coverage"]
 
@@ -90,9 +92,10 @@ def synthetic(n_matches=1500, pm_noise=0.35, open_noise=0.20, close_noise=0.10, 
         for j, o in enumerate("HDA"):
             ts = int(i * 86400 / per_day)
             p_close = float(sg(lg(true[j]) + rng.normal(0, pm_noise)))
-            rows.append({"ts_open": ts - 86400, "ts_close": ts, "match_id": i, "source": "SIM", "outcome": o,
-                         "league": ("E0", "SP1", "I1", "D1", "F1")[i % 5], "decision_h": 24,
-                         "p_pm_open": float(sg(lg(p_close) + rng.normal(0, 0.1))), "p_pm_close": p_close,
-                         "y": int(res == j), "vol_open": vol * 0.6, "vol_close": vol,
+            p6 = float(sg(lg(p_close) + rng.normal(0, 0.05)))
+            rows.append({"ts_24": ts - 86400, "ts_6": ts - 6 * 3600, "ts_close": ts, "match_id": i,
+                         "source": "SIM", "outcome": o, "league": ("E0", "SP1", "I1", "D1", "F1")[i % 5],
+                         "p_pm_24": float(sg(lg(p6) + rng.normal(0, 0.1))), "p_pm_6": p6, "p_pm_close": p_close,
+                         "y": int(res == j), "vol_24": vol * 0.6, "vol_6": vol * 0.8, "vol_close": vol,
                          "oH": oc[0], "oD": oc[1], "oA": oc[2], "ooH": oo[0], "ooD": oo[1], "ooA": oo[2]})
     return pd.DataFrame(rows)

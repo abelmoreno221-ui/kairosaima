@@ -1,4 +1,5 @@
 import json
+import numpy as np
 import os
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from pmarb.devig import multiplicative, power, shin, METHODS
 from pmarb.model import Blend
 from pmarb.matching import match_event, outcome_of
 from pmarb.backtest import (Cfg, decide, run, with_book, grid, fee_per_share, settle, half_spread_at,
-                            check_single_source, _solo_fails)
+                            check_single_source, _solo_fails, eligible, predict_oos, simulate)
 from pmarb.odds import load_football_data, TRACKS
 from pmarb import spreads as spr
 from pmarb.dataset import synthetic, coverage, LowCoverage
@@ -106,7 +107,7 @@ class Liquidity(unittest.TestCase):
 
     def test_unknown_volume_reported_apart(self):
         df = synthetic(600)
-        df.loc[df.match_id % 3 == 0, ["vol_open", "vol_close"]] = float("nan")
+        df.loc[df.match_id % 3 == 0, ["vol_24", "vol_6", "vol_close"]] = float("nan")
         s, t = run(with_book(df, "close", "shin"), Cfg(min_volume=0))
         u = s["unknown_volume"]
         self.assertGreater(u["markets"], 0)
@@ -144,6 +145,33 @@ class Sources(unittest.TestCase):
             f = self._csv(d, "a.csv", ["BFE"])
             x = pd.read_csv(f); x.loc[0, "BFECH"] = None; x.to_csv(f, index=False)
             self.assertEqual(len(load_football_data(f, "BFE", log=lambda *_: None)), 1)
+
+    def test_absent_column_truncates_and_continues(self):
+        with tempfile.TemporaryDirectory() as d:
+            f1, f2 = self._csv(d, "2526.csv", ["PS"]), self._csv(d, "2627.csv", ["Avg"])   # 26/27 sin PSH
+            logs = []
+            df = load_football_data([f1, f2], "PS", log=logs.append)
+            self.assertEqual(len(df), 2)
+            self.assertTrue(any("columna ausente" in l and "2627.csv" in l for l in logs))
+            self.assertTrue(any("truncada" in l for l in logs))
+            with self.assertRaisesRegex(SystemExit, "columna ausente"):
+                load_football_data([f2], "PS", log=lambda *_: None)
+
+    def test_drop_dates_block_vs_drip(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "x.csv")
+            dates = [f"{i:02d}/09/2025" for i in range(1, 11)]
+            base = {"Div": "E0", "HomeTeam": "A", "AwayTeam": "B", "FTR": "H",
+                    "PSH": 2.0, "PSD": 3.0, "PSA": 4.0, "PSCH": 2.0, "PSCD": 3.0, "PSCA": 4.0}
+            x = pd.DataFrame([{**base, "Date": dt} for dt in dates])
+            x.loc[7:, "PSH"] = None                                  # bloque final
+            x.to_csv(f, index=False)
+            dr = load_football_data(f, "PS", log=lambda *_: None).attrs["drops"].iloc[0]
+            self.assertTrue(dr.pattern.startswith("bloque final desde 2025-09-08"))
+            self.assertEqual(dr.dates, "2025-09-08,2025-09-09,2025-09-10")
+            x = pd.DataFrame([{**base, "Date": dt} for dt in dates]); x.loc[[1, 5], "PSCH"] = None
+            x.to_csv(f, index=False)
+            self.assertEqual(load_football_data(f, "PS", log=lambda *_: None).attrs["drops"].iloc[0].pattern, "goteo")
 
     def test_track_C_invalid(self):
         self.assertFalse(TRACKS["C"]["valid"])
@@ -204,10 +232,10 @@ class Grid(unittest.TestCase):
             self.assertIn(k, self.v)
         self.assertIn("referencia", self.v["verdict"])      # fuente SIM != Pinnacle -> no es veredicto
         fn = pd.DataFrame(self.v["funnel"])
-        self.assertEqual(list(fn.columns[1:6]), ["emparejados", "vivo_T-24h", "supera_volumen",
+        self.assertEqual(list(fn.columns[1:6]), ["emparejados", "mercado_vivo", "supera_volumen",
                                                   "vol_desconocido", "con_señal_neta"])
-        self.assertTrue((fn.emparejados >= fn["vivo_T-24h"]).all())
-        self.assertTrue((fn["vivo_T-24h"] >= fn.supera_volumen).all())
+        self.assertTrue((fn.emparejados >= fn.mercado_vivo).all())
+        self.assertTrue((fn.mercado_vivo >= fn.supera_volumen).all())
         self.assertTrue((fn.supera_volumen >= fn.con_señal_neta).all())
         self.assertIn("regla_pin", self.res[("open", "shin", "0.01")])
 
@@ -217,7 +245,8 @@ class Grid(unittest.TestCase):
         s["groups"]["solo_modelo"]["n"] = 10
         self.assertFalse(_solo_fails(s))
 
-    def _verdict(self, alive=True, solo_fails=False, solo_n=40, n=400, src="PS"):
+    def _verdict(self, alive=True, solo_fails=False, solo_n=40, n=400, src="PS", rule=None, roi=0.05,
+                 decision="24"):
         import pmarb.backtest as bt
         df = synthetic(400).assign(source=src)
         orig = bt.summarize
@@ -226,26 +255,66 @@ class Grid(unittest.TestCase):
             r["signals"] = n
             r["groups"]["solo_modelo"]["n"] = solo_n
             r["groups"]["con_pinnacle"]["roi_ci95"] = [0.01, 0.05]
+            r["roi"] = roi
+            r["oos_logloss"] = {"pm": 0.6, "book": 0.5, "model": 0.55}
             return r
+        rp = (lambda *a, **k: rule) if rule else (lambda *a, **k: {"n": 0, "roi": 0.0, "roi_ci95": None,
+                                                                   "signals_per_week": 0.0})
         with mock.patch.object(bt, "_solo_fails", return_value=solo_fails), \
-             mock.patch.object(bt, "_alive", return_value=alive), mock.patch.object(bt, "summarize", fake):
-            return grid(df, Cfg(min_train=200), methods=("shin",), spreads=(0.01,))[1]
+             mock.patch.object(bt, "_alive", return_value=alive), mock.patch.object(bt, "summarize", fake), \
+             mock.patch.object(bt, "_rule_pin", rp):
+            return grid(df, Cfg(min_train=200), methods=("shin",), spreads=(0.01,), decision=decision)[1]
 
     def test_verdict_no_candidata(self):
         self.assertTrue(self._verdict(solo_fails=True)["verdict"].startswith("no candidata"))
 
     def test_verdict_floor_150_bets(self):
         self.assertTrue(self._verdict(n=149)["verdict"].startswith("no evaluable"))
-        self.assertTrue(self._verdict(n=150)["verdict"].startswith("candidata"))
+        self.assertTrue(self._verdict(n=150)["verdict"].startswith("candidata: modelo"))
 
-    def test_small_solo_recommends_pinnacle_rule(self):
+    def test_small_solo_is_not_evaluable(self):
         v = self._verdict(solo_n=5)
         self.assertTrue(v["verdict"].startswith("no evaluable"))
-        self.assertTrue(any("quitar la regresión" in r for r in v["recommendation"]))
         self.assertTrue(any("NO es el ROI de la regla" in r for r in v["recommendation"]))
+
+    def test_rule_beats_model_changes_verdict(self):
+        good = {"n": 300, "roi": 0.08, "roi_ci95": [0.01, 0.15], "signals_per_week": 5.0}
+        v = self._verdict(rule=good, roi=0.05)
+        self.assertTrue(v["verdict"].startswith("candidata: REGLA SIN MODELO"))
+        self.assertTrue(v["rule_beats_model"])
+        self.assertTrue(self._verdict(rule=good, solo_n=5)["verdict"].startswith("candidata: REGLA"))
+        # modelo no evaluable: gana la regla aunque el ROI del modelo sea mayor
+        self.assertTrue(self._verdict(rule=good, solo_n=5, roi=0.2)["verdict"].startswith("candidata: REGLA"))
+        self.assertFalse(self._verdict(rule={**good, "n": 100})["rule_beats_model"])   # <150 no cuenta
+        self.assertTrue(self._verdict(rule=good, roi=0.12)["verdict"].startswith("candidata: modelo"))
+
+    def test_close_horizon_is_research_ceiling(self):
+        v = self._verdict(decision="close")
+        self.assertTrue(v["verdict"].startswith("techo de investigación"))
+        self.assertIn("T-10min", v["verdict"])
 
     def test_track_C_marked_invalid(self):
         self.assertIn("NO VÁLIDO", self._verdict(src="Max")["verdict"])
+
+    def test_rule_pin_same_filters_as_model(self):
+        df = synthetic(500)
+        df.loc[df.match_id % 4 == 0, "vol_24"] = 10.0             # bajo volumen
+        df.loc[df.match_id % 4 == 1, "p_pm_24"] = float("nan")    # sin mercado vivo
+        d = with_book(df, "open", "shin", "24")
+        preds, _ = predict_oos(d, Cfg(min_train=200))
+        cfg = Cfg(min_train=200, min_edge=-1.0)                    # todo lo elegible opera
+        ok = eligible(d, preds, cfg)
+        rule_rows = simulate(d, np.where(np.isnan(preds), np.nan, d.p_book.values), cfg)
+        model_rows = simulate(d, preds, cfg)
+        self.assertEqual(len(rule_rows), int(ok.sum()))
+        self.assertEqual(len(model_rows), int(ok.sum()))
+        self.assertFalse(set(rule_rows.match_id) & set(df.match_id[df.match_id % 4 < 2]))
+
+    def test_decision_points(self):
+        df = synthetic(300)
+        self.assertTrue((with_book(df, "open", "shin", "6").hours == 6).all())
+        self.assertTrue((with_book(df, "open", "shin", "24").p_pm.values == df.p_pm_24.values).all())
+        self.assertTrue((with_book(df, "close", "shin", "24").hours < 1).all())
 
     def test_no_edge_when_sources_equal(self):
         df = with_book(synthetic(800, pm_noise=0.0, close_noise=0.0, margin=0.0), "close", "prop")

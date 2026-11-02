@@ -18,12 +18,19 @@ Busca partidos de fútbol en los que el precio de Polymarket no coincide con la 
 | **B** | 26/27 | Betfair Exchange (`BFEH/BFED/BFEA`, cierre `BFEC*`) | Solo referencia |
 | **C** | 25/26 + 26/27 | `Avg` (o `Max` con `--book Max`) | **Inválida**, solo diagnóstico. `Max` es un outlier por construcción e infla el edge |
 
-- **Fallback por descarte de filas:** se tiran las filas a las que les falta alguna de las seis cuotas de la casa de la pista (apertura o cierre), y el log cuenta cuántas. Si no queda ninguna, se aborta. El backtest también se aborta si un dataset mezcla casas.
+- **Valor vacío:** se descarta la fila y se cuenta. El informe muestra por fichero las fechas descartadas y si forman un **bloque** (corte de la fuente, p. ej. "bloque final desde 2026-01-08") o un **goteo** (huecos sueltos).
+- **Columna ausente en un fichero** (p. ej. `PSH` en 26/27): aviso con el nombre del fichero, ese fichero se omite, la temporada se trunca en el último partido con datos y se continúa. Solo se aborta si la columna falta en todos los ficheros, con el mensaje "columna ausente".
+- El backtest se aborta si un dataset mezcla casas.
 - **Betfair Exchange:** es un exchange, no una casa. No tiene margen en la cuota; cobra una comisión del 5 % sobre la ganancia neta, rebajable al 2 %. En 25/26 hay 22 partidos sin cierre de BFE, que se descartan.
 
-### Horizontes
-- **Apertura de football-data:** se recoge los viernes y martes por la tarde, así que equivale a **T-24h a T-72h** del saque. El backtest con esta línea toma el precio y el volumen de Polymarket a **T-24h**, y el escáner decide también a **T-24h** (±1h).
-- **Cierre:** se fija al saque. El precio de Polymarket se toma a T-10min. Solo sirve como investigación.
+### Horizontes (`backtest --decision-h`)
+| `--decision-h` | Cuotas | Precio y volumen de PM | Papel |
+|---|---|---|---|
+| `6` | apertura | T-6h | **Operativo.** Es el horizonte por defecto del escáner (T-6h ±1h). En vivo, el escáner usa la cuota de la casa del momento; en el backtest, la apertura es más antigua, así que es un proxy prudente |
+| `24` (por defecto) | apertura (recogida viernes/martes por la tarde = T-24h..T-72h) | T-24h | **Validación conservadora** |
+| `close` | cierre | T-10min | **Techo de investigación.** El cierre no se conoce al decidir, así que el veredicto nunca pasa de "techo de investigación" |
+
+`build` guarda los tres puntos (`ts_/p_pm_/vol_` + `24`, `6`, `close`) con una sola llamada a `prices-history` por mercado, de modo que cambiar de horizonte no obliga a reconstruir el dataset.
 
 ## Pipeline
 | Paso | Módulo | Qué hace |
@@ -43,7 +50,8 @@ pip install -r requirements.txt
 python -m pmarb build --track A     # 25/26 Pinnacle hasta 08/01/2026 -> dataset_A.csv (aborta si la cobertura es baja)
 python -m pmarb build --track B     # 26/27 Betfair Exchange           -> dataset_B.csv
 python -m pmarb build --track C --book Avg   # diagnóstico, inválida
-python -m pmarb build --track A --decision-h 6   # si el embudo marca T-24h como no viable
+python -m pmarb backtest dataset_A.csv --decision-h 6       # horizonte operativo
+python -m pmarb backtest dataset_A.csv --decision-h close   # techo de investigación
 python -m pmarb spreads sample      # cada hora, 1-2 semanas; solo mercados a <48h del saque
 python -m pmarb spreads summary     # -> spread_table.json (mediana del medio spread por precio x horas al saque)
 python -m pmarb backtest dataset_A.csv --spread-table spread_table.json   # veredicto
@@ -53,15 +61,17 @@ python -m unittest discover -s tests -t .
 La cobertura de fútbol de Polymarket empieza en 2025, por eso solo se usan 25/26 y 26/27.
 
 ## Cómo leer el resultado
-- **Embudo por liga (diagnóstico principal):** cuatro escalones, siempre sobre la línea de apertura:
+- **Embudo por liga (diagnóstico principal):** cuatro escalones, en el horizonte de `--decision-h`:
   1. partidos emparejados,
-  2. partidos con mercado vivo a T-24h,
+  2. partidos con mercado vivo en el horizonte elegido,
   3. partidos que superan el filtro de volumen (los de volumen desconocido van en columna aparte),
   4. partidos con señal neta (solo en el periodo fuera de muestra).
 
-  Si el tercer escalón deja **menos de 20 partidos en una liga**, esa liga sale marcada: el horizonte T-24h no es viable ahí y hay que reconstruir con `--decision-h 6`.
+  Si el tercer escalón deja **menos de 20 partidos en una liga**, esa liga sale marcada: el horizonte elegido no es viable ahí (con T-24h, hay que probar `--decision-h 6`).
 - **Suelo de muestra:** con menos de **150 apuestas colocadas**, ningún veredicto pasa de "no evaluable", aunque el IC salga limpio.
-- **`regla_pin`:** la regla sin modelo, es decir, Pinnacle directa frente al ask con el mismo umbral y el mismo periodo. **No es lo mismo que el grupo `con_pinnacle`**: esas señales las elige y las dimensiona el modelo. Si `solo_modelo` no es evaluable (menos de 30 señales) y `con_pinnacle` funciona, el informe recomienda quitar la regresión y usar esta regla.
+- **`regla_pin`:** la regla sin modelo, es decir, Pinnacle directa frente al ask con el mismo umbral y los mismos costes. Pasa por **la misma máscara de filas** que el modelo (`eligible`: mercado vivo, cobertura, periodo fuera de muestra y volumen). Hay un test que lo comprueba.
+  - **El veredicto pasa automáticamente a "candidata: REGLA SIN MODELO"** si la regla está viva (IC > 0, al menos 150 apuestas y Pinnacle mejor que PM en log-loss) y además el modelo no puede ser candidato (no vivo, `solo_modelo` pierde o no es evaluable) o rinde menos.
+  - El ROI del grupo `con_pinnacle` **no** es el de esta regla: esas señales las elige y las dimensiona el modelo.
 - **`sig/wk`, `sig/wk_med` y `zero_wks`:** la cifra que decide el proyecto. Señales netas después de comisión, medio spread y volumen previo mínimo.
 - **`half_spr`:** es **medio** spread en $ por acción. Comprar como taker cuesta `mid + half_spr` y se paga al entrar. `edge_dies_at_half_spread` es el primer nivel en el que el IC 95 % del ROI deja de quedar por encima de 0. El nivel `cal` usa la tabla medida con `spreads`.
 - **Cierre frente a apertura:** el cierre no se conoce al decidir, así que solo vale como investigación. El veredicto es "estrategia candidata" únicamente si hay edge en apertura.
